@@ -136,6 +136,8 @@ def cut_mp3(ffmpeg_bin: str, source: Path, output: Path, start: float, end: floa
         return 0
 
     completed = subprocess.run(command, check=False)
+    if completed.returncode != 0:
+        print(f"Error: ffmpeg failed with exit code {completed.returncode}", file=sys.stderr)
     return completed.returncode
 
 
