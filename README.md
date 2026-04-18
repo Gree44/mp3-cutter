@@ -4,7 +4,7 @@ lightweight tool to cut out sections of mp3-files lossless, based on prepared cu
 ## Usage
 
 ```bash
-python3 /home/runner/work/mp3-cutter/mp3-cutter/rekordbox_cut.py \
+python3 rekordbox_cut.py \
   --xml /path/to/rekordbox.xml \
   --track /path/to/song.mp3 \
   --output /path/to/song_cut.mp3
@@ -20,7 +20,7 @@ The script will:
 ### Dry-run
 
 ```bash
-python3 /home/runner/work/mp3-cutter/mp3-cutter/rekordbox_cut.py \
+python3 rekordbox_cut.py \
   --xml /path/to/rekordbox.xml \
   --track /path/to/song.mp3 \
   --dry-run
@@ -31,7 +31,7 @@ python3 /home/runner/work/mp3-cutter/mp3-cutter/rekordbox_cut.py \
 If your cut markers have custom names, pass them explicitly:
 
 ```bash
-python3 /home/runner/work/mp3-cutter/mp3-cutter/rekordbox_cut.py \
+python3 rekordbox_cut.py \
   --xml /path/to/rekordbox.xml \
   --track /path/to/song.mp3 \
   --start-mark intro \
