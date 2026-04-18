@@ -64,7 +64,11 @@ def find_track(root: ET.Element, target_track: Path) -> ET.Element:
             continue
         try:
             track_path = decode_rekordbox_location(location)
-        except OSError:
+        except OSError as exc:
+            print(
+                f"Warning: skipping unreadable rekordbox track Location '{location}': {exc}",
+                file=sys.stderr,
+            )
             continue
         if normalize_for_match(track_path) == target:
             return track
@@ -81,6 +85,10 @@ def get_marker_times(track: ET.Element, start_mark: str, end_mark: str) -> tuple
         try:
             start_value = float(raw_start)
         except ValueError:
+            print(
+                f"Warning: skipping POSITION_MARK with invalid Start value '{raw_start}'",
+                file=sys.stderr,
+            )
             continue
         markers.append((pm.attrib.get("Name", ""), start_value))
 
