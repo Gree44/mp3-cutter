@@ -14,7 +14,7 @@ The script will:
 - locate the track in the rekordbox XML by matching `TRACK Location` to `--track`
 - extract cut timestamps from `POSITION_MARK` entries
 - prefer markers named `start`/`end` (or `in`/`out`) when present
-- otherwise use the first two marker timestamps in ascending order
+- otherwise use the earliest and latest marker timestamps
 - call `ffmpeg -c copy` so the mp3 is cut without re-encoding
 
 ### Dry-run

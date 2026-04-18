@@ -107,7 +107,7 @@ def get_marker_times(track: ET.Element, start_mark: str, end_mark: str) -> tuple
             start, end = named_start[0], named_end[0]
         else:
             ordered = sorted(t for _, t in markers)
-            start, end = ordered[0], ordered[1]
+            start, end = ordered[0], ordered[-1]
 
     if end <= start:
         raise ValueError(f"Invalid cut markers: end ({end}) must be greater than start ({start})")
