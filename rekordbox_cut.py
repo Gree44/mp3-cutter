@@ -52,6 +52,17 @@ def normalize_for_match(path: Path | str) -> str:
     return str(Path(path).expanduser().resolve()).casefold()
 
 
+def load_rekordbox_xml(xml_path: Path) -> ET.Element:
+    text = xml_path.read_text(encoding="utf-8", errors="replace")
+    upper = text.upper()
+    if "<!DOCTYPE" in upper or "<!ENTITY" in upper:
+        raise ValueError("Unsafe XML content detected: DOCTYPE/ENTITY declarations are not allowed")
+    try:
+        return ET.fromstring(text)
+    except ET.ParseError as exc:
+        raise ValueError("Failed to parse XML file: malformed or invalid rekordbox XML") from exc
+
+
 def find_track(root: ET.Element, target_track: Path) -> ET.Element:
     target = normalize_for_match(target_track)
     collection = root.find("./COLLECTION")
@@ -161,10 +172,10 @@ def main() -> int:
     output = args.output or args.track.with_name(f"{args.track.stem}_cut{args.track.suffix}")
 
     try:
-        root = ET.parse(args.xml).getroot()
+        root = load_rekordbox_xml(args.xml)
         track = find_track(root, args.track)
         start, end = get_marker_times(track, args.start_mark, args.end_mark)
-    except (ET.ParseError, OSError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
