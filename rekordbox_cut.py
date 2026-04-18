@@ -85,7 +85,9 @@ def get_marker_times(track: ET.Element, start_mark: str, end_mark: str) -> tuple
         markers.append((pm.attrib.get("Name", ""), start_value))
 
     if len(markers) < 2:
-        raise ValueError("Track does not have enough POSITION_MARK entries to derive a cut")
+        raise ValueError(
+            f"Track has {len(markers)} POSITION_MARK entries but needs at least 2 to derive a cut"
+        )
 
     if start_mark and end_mark:
         wanted_start = start_mark.casefold()
