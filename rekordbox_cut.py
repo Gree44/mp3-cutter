@@ -53,7 +53,7 @@ def normalize_for_match(path: Path | str) -> str:
 
 
 def load_rekordbox_xml(xml_path: Path) -> ET.Element:
-    text = xml_path.read_text(encoding="utf-8", errors="replace")
+    text = xml_path.read_text(encoding="utf-8", errors="strict")
     upper = text.upper()
     if "<!DOCTYPE" in upper or "<!ENTITY" in upper:
         raise ValueError("Unsafe XML content detected: DOCTYPE/ENTITY declarations are not allowed")
@@ -75,7 +75,7 @@ def find_track(root: ET.Element, target_track: Path) -> ET.Element:
             continue
         try:
             track_path = decode_rekordbox_location(location)
-        except OSError as exc:
+        except (ValueError, OSError) as exc:
             print(
                 f"Warning: skipping unreadable rekordbox track Location '{location}': {exc}",
                 file=sys.stderr,
