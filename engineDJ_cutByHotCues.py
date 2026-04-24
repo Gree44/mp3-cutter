@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MP3 Frame Cutter — Cut sections from MP3 files using Engine DJ hotcues.
-Removes MP3 frames between two hotcue positions without re-encoding.
+Audio Cutter — Cut sections from MP3, FLAC, or WAV files using Engine DJ hotcues.
+Removes audio between two hotcue positions without re-encoding.
 """
 
 import struct
@@ -9,17 +9,23 @@ import sqlite3
 import zlib
 import os
 import sys
+import wave
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION — Edit these variables before running
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TRACK_FILENAME = "example_track.mp3"
-HOTCUE_START = 2          # Hotcue number (1–8) — cut begins here
-HOTCUE_END = 5            # Hotcue number (1–8) — cut ends here
+TRACK_FILENAME = "01 - Titanium (feat. Sia) (Extended).flac"  # supports .mp3, .flac, .wav
+HOTCUE_START = 5          # Hotcue number (1–8) — cut begins here
+HOTCUE_END = 6            # Hotcue number (1–8) — cut ends here
 OUTPUT_APPENDIX = "(Short Edit)"
 OUTPUT_PATH = os.path.dirname(os.path.abspath(__file__))
 ENGINE_DB_PATH = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
+
+# Remap stale Engine DJ paths to their current locations when files have moved.
+PATH_REMAPS = [
+    ("~/Music/OneDrive", "~/Library/CloudStorage/OneDrive-Personal"),
+]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MP3 constants
@@ -108,6 +114,124 @@ def read_id3v2_size(data):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# FLAC constants and utilities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_crc8_table():
+    t = []
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            c = ((c << 1) ^ 0x07) & 0xFF if c & 0x80 else (c << 1) & 0xFF
+        t.append(c)
+    return bytes(t)
+
+_FLAC_CRC8_TABLE = _make_crc8_table()
+
+FLAC_BLOCK_SIZE_TABLE = {
+    0x00: None,   # reserved
+    0x01: 192,
+    0x02: 576, 0x03: 1152, 0x04: 2304, 0x05: 4608,
+    0x06: None,   # 8-bit value follows header
+    0x07: None,   # 16-bit value follows header
+    0x08: 256,  0x09: 512,  0x0A: 1024, 0x0B: 2048,
+    0x0C: 4096, 0x0D: 8192, 0x0E: 16384, 0x0F: 32768,
+}
+
+
+def _flac_crc8(data):
+    crc = 0
+    for b in data:
+        crc = _FLAC_CRC8_TABLE[crc ^ b]
+    return crc
+
+
+def _flac_read_utf8_int(data, pos):
+    """Read UTF-8 coded unsigned int from FLAC frame header. Returns (value, new_pos) or (None, pos)."""
+    if pos >= len(data):
+        return None, pos
+    b0 = data[pos]
+    if not (b0 & 0x80):
+        return b0, pos + 1
+    n = 0
+    tmp = b0
+    while tmp & 0x80:
+        n += 1
+        tmp = (tmp << 1) & 0xFF
+    if n < 2 or n > 7 or pos + n > len(data):
+        return None, pos
+    val = b0 & (0x7F >> n)
+    for i in range(1, n):
+        cb = data[pos + i]
+        if (cb & 0xC0) != 0x80:
+            return None, pos
+        val = (val << 6) | (cb & 0x3F)
+    return val, pos + n
+
+
+def _parse_flac_frame_header(data, pos):
+    """
+    Parse FLAC frame header at data[pos]. Validates CRC-8.
+    Returns dict with block_size and header_end offset, or None if invalid.
+    """
+    if pos + 5 > len(data):
+        return None
+    # Sync word: 14 bits 0x3FFE, then reserved=0, then blocking_strategy
+    if data[pos] != 0xFF or (data[pos + 1] & 0xFE) != 0xF8:
+        return None
+
+    byte2 = data[pos + 2]
+    byte3 = data[pos + 3]
+
+    if byte3 & 0x01:  # reserved bit must be 0
+        return None
+
+    block_size_bits = (byte2 >> 4) & 0x0F
+    sample_rate_bits = byte2 & 0x0F
+
+    if sample_rate_bits == 0x0F:  # invalid
+        return None
+
+    p = pos + 4
+
+    # UTF-8 coded frame/sample number
+    val, p = _flac_read_utf8_int(data, p)
+    if val is None:
+        return None
+
+    # Optional block size
+    if block_size_bits == 0x06:
+        if p >= len(data):
+            return None
+        block_size = data[p] + 1
+        p += 1
+    elif block_size_bits == 0x07:
+        if p + 1 >= len(data):
+            return None
+        block_size = struct.unpack(">H", data[p:p + 2])[0] + 1
+        p += 2
+    else:
+        block_size = FLAC_BLOCK_SIZE_TABLE.get(block_size_bits)
+        if block_size is None:
+            return None
+
+    # Optional sample rate bytes
+    if sample_rate_bits == 0x0C:
+        p += 1
+    elif sample_rate_bits in (0x0D, 0x0E):
+        p += 2
+
+    if p >= len(data):
+        return None
+
+    # CRC-8 covers everything from sync to here (exclusive of crc byte itself)
+    if _flac_crc8(data[pos:p]) != data[p]:
+        return None
+
+    return {"block_size": block_size, "header_end": p + 1}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Engine DJ database access
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -189,9 +313,27 @@ def get_hotcues(db_path, track_id):
 
 
 def resolve_track_path(db_path, relative_path):
-    """Resolve a track's relative path (from the DB) to an absolute path."""
+    """Resolve a track path from the DB to an existing absolute path if possible."""
     db_dir = os.path.dirname(os.path.abspath(db_path))
-    return os.path.normpath(os.path.join(db_dir, relative_path))
+    resolved = os.path.normpath(os.path.expanduser(os.path.join(db_dir, relative_path)))
+
+    if os.path.isfile(resolved):
+        return resolved
+
+    for legacy_root, current_root in PATH_REMAPS:
+        legacy_abs = os.path.normpath(os.path.expanduser(legacy_root))
+        current_abs = os.path.normpath(os.path.expanduser(current_root))
+        try:
+            if os.path.commonpath([resolved, legacy_abs]) == legacy_abs:
+                rel = os.path.relpath(resolved, legacy_abs)
+                remapped = os.path.normpath(os.path.join(current_abs, rel))
+                if os.path.isfile(remapped):
+                    return remapped
+        except ValueError:
+            # Paths on different mounts/drives cannot share a common root.
+            continue
+
+    return resolved
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -287,6 +429,169 @@ def cut_mp3(input_path, output_path, cut_start_samples, cut_end_samples):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Frame-accurate FLAC cutting
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples):
+    """
+    Remove FLAC frames that best match the region [cut_start, cut_end).
+    Validates each frame boundary with CRC-8. Updates STREAMINFO total_samples
+    and replaces SEEKTABLE with PADDING (seek points become invalid after cutting).
+    Does not re-encode audio.
+    """
+    with open(input_path, "rb") as f:
+        data = f.read()
+
+    if data[:4] != b"fLaC":
+        print("Error: Not a valid FLAC file.")
+        sys.exit(1)
+
+    # --- Parse metadata blocks ---
+    pos = 4
+    output_meta = []  # list of [is_last_flag, block_type, bytearray_of_data]
+    streaminfo_ref = None
+    sample_rate = 44100  # fallback; will be overwritten from STREAMINFO
+
+    while pos + 4 <= len(data):
+        is_last = (data[pos] >> 7) & 1
+        block_type = data[pos] & 0x7F
+        length = (data[pos + 1] << 16) | (data[pos + 2] << 8) | data[pos + 3]
+        block_data = bytearray(data[pos + 4: pos + 4 + length])
+
+        if block_type == 0:  # STREAMINFO
+            streaminfo_ref = block_data
+            sample_rate = (block_data[10] << 12) | (block_data[11] << 4) | (block_data[12] >> 4)
+            output_meta.append([is_last, 0, block_data])
+        elif block_type == 3:  # SEEKTABLE — replace with PADDING; offsets change after cut
+            output_meta.append([is_last, 1, bytearray(length)])
+        else:
+            output_meta.append([is_last, block_type, block_data])
+
+        pos += 4 + length
+        if is_last:
+            break
+
+    if streaminfo_ref is None:
+        print("Error: No STREAMINFO block found in FLAC file.")
+        sys.exit(1)
+
+    audio_start = pos
+
+    # --- Scan for frame boundaries using sync + CRC-8 validation ---
+    frame_starts = []  # (file_offset, block_size)
+    p = audio_start
+    while p + 4 <= len(data):
+        if data[p] == 0xFF and (data[p + 1] & 0xFE) == 0xF8:
+            result = _parse_flac_frame_header(data, p)
+            if result is not None:
+                frame_starts.append((p, result["block_size"]))
+                p += 2
+                continue
+        p += 1
+
+    if not frame_starts:
+        print("Error: No valid FLAC frames found.")
+        sys.exit(1)
+
+    # Build frame list: (offset, byte_size, start_sample, block_size)
+    frames = []
+    current_sample = 0
+    for i, (fpos, block_size) in enumerate(frame_starts):
+        next_pos = frame_starts[i + 1][0] if i + 1 < len(frame_starts) else len(data)
+        frames.append((fpos, next_pos - fpos, current_sample, block_size))
+        current_sample += block_size
+
+    spf = frames[0][3]  # typical samples per frame (from first frame)
+
+    # --- Determine optimal cut region (same logic as MP3) ---
+    desired_length = cut_end_samples - cut_start_samples
+    num_frames_to_cut = round(desired_length / spf)
+
+    best_start_idx = min(
+        range(len(frames)),
+        key=lambda i: abs(frames[i][2] - cut_start_samples),
+    )
+
+    if best_start_idx + num_frames_to_cut > len(frames):
+        num_frames_to_cut = len(frames) - best_start_idx
+
+    end_idx = best_start_idx + num_frames_to_cut
+
+    actual_start_sample = frames[best_start_idx][2]
+    actual_end_sample = frames[end_idx][2] if end_idx < len(frames) else current_sample
+    actual_length = actual_end_sample - actual_start_sample
+    drift = actual_length - desired_length
+    new_total_samples = current_sample - actual_length
+
+    # --- Update STREAMINFO total_samples (36-bit field) and zero MD5 ---
+    streaminfo_ref[13] = (streaminfo_ref[13] & 0xF0) | ((new_total_samples >> 32) & 0x0F)
+    streaminfo_ref[14] = (new_total_samples >> 24) & 0xFF
+    streaminfo_ref[15] = (new_total_samples >> 16) & 0xFF
+    streaminfo_ref[16] = (new_total_samples >> 8) & 0xFF
+    streaminfo_ref[17] = new_total_samples & 0xFF
+    for i in range(18, 34):  # zero MD5: audio content changed
+        streaminfo_ref[i] = 0
+
+    # --- Write output ---
+    with open(output_path, "wb") as f:
+        f.write(b"fLaC")
+        for k, (_, btype, bdata) in enumerate(output_meta):
+            is_last_out = 1 if k == len(output_meta) - 1 else 0
+            f.write(bytes([is_last_out << 7 | btype]))
+            f.write(bytes([(len(bdata) >> 16) & 0xFF, (len(bdata) >> 8) & 0xFF, len(bdata) & 0xFF]))
+            f.write(bdata)
+        for i, (foff, fsize, _, _) in enumerate(frames):
+            if i < best_start_idx or i >= end_idx:
+                f.write(data[foff: foff + fsize])
+
+    print(f"\n  Total frames  : {len(frames)}")
+    print(f"  Cut frames    : {num_frames_to_cut}")
+    print(f"  Desired cut   : {desired_length:.0f} samples ({desired_length / sample_rate:.3f} s)")
+    print(f"  Actual cut    : {actual_length:.0f} samples ({actual_length / sample_rate:.3f} s)")
+    print(f"  Drift         : {drift:+.0f} samples ({drift / sample_rate * 1000:+.2f} ms)")
+    print(f"  New duration  : ~{new_total_samples / sample_rate:.2f} s")
+    print(f"  Output file   : {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sample-accurate WAV cutting
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def cut_wav(input_path, output_path, cut_start_samples, cut_end_samples):
+    """
+    Remove PCM samples in [cut_start, cut_end) from a WAV file.
+    Uses Python's stdlib wave module; no re-encoding needed since WAV is uncompressed.
+    """
+    with wave.open(input_path, "rb") as r:
+        params = r.getparams()
+        all_frames = r.readframes(params.nframes)
+
+    sample_rate = params.framerate
+    frame_width = params.nchannels * params.sampwidth  # bytes per sample (all channels)
+
+    total_samples = params.nframes
+    start = max(0, min(int(cut_start_samples), total_samples))
+    end = max(start, min(int(cut_end_samples), total_samples))
+
+    kept = all_frames[: start * frame_width] + all_frames[end * frame_width :]
+    new_total = total_samples - (end - start)
+    actual_length = end - start
+    drift = actual_length - (cut_end_samples - cut_start_samples)
+
+    with wave.open(output_path, "wb") as w:
+        w.setparams(params._replace(nframes=new_total))
+        w.writeframes(kept)
+
+    print(f"\n  Total samples : {total_samples}")
+    print(f"  Cut samples   : {actual_length}")
+    print(f"  Desired cut   : {cut_end_samples - cut_start_samples:.0f} samples ({(cut_end_samples - cut_start_samples) / sample_rate:.3f} s)")
+    print(f"  Actual cut    : {actual_length:.0f} samples ({actual_length / sample_rate:.3f} s)")
+    print(f"  Drift         : {drift:+.0f} samples ({drift / sample_rate * 1000:+.2f} ms)")
+    print(f"  New duration  : ~{new_total / sample_rate:.2f} s")
+    print(f"  Output file   : {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -332,11 +637,21 @@ def main():
         sys.exit(1)
 
     name, ext = os.path.splitext(track_fn)
+    ext_lower = ext.lower()
+    if ext_lower not in (".mp3", ".flac", ".wav"):
+        print(f"Error: Unsupported file format '{ext}'. Supported: .mp3, .flac, .wav")
+        sys.exit(1)
+
     output_filename = f"{name} {OUTPUT_APPENDIX}{ext}"
     output_filepath = os.path.join(OUTPUT_PATH, output_filename)
 
-    print(f"\nCutting frames between Cue {HOTCUE_START} and Cue {HOTCUE_END} …")
-    cut_mp3(track_abs_path, output_filepath, cut_start, cut_end)
+    print(f"\nCutting between Cue {HOTCUE_START} and Cue {HOTCUE_END} …")
+    if ext_lower == ".mp3":
+        cut_mp3(track_abs_path, output_filepath, cut_start, cut_end)
+    elif ext_lower == ".flac":
+        cut_flac(track_abs_path, output_filepath, cut_start, cut_end)
+    else:
+        cut_wav(track_abs_path, output_filepath, cut_start, cut_end)
 
 
 if __name__ == "__main__":
