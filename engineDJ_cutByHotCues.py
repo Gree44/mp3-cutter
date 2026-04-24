@@ -7,6 +7,7 @@ with zero-crossing snap; MP3 is cut frame-accurately (lossless, no re-encoding).
 
 import struct
 import sqlite3
+import subprocess
 import zlib
 import os
 import sys
@@ -26,7 +27,7 @@ except ImportError:
     _HAS_PEDALBOARD = False
 
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TIT2
+from mutagen.id3 import ID3, TIT2, TLEN
 from mutagen.mp3 import MP3
 from mutagen.wave import WAVE
 
@@ -47,12 +48,13 @@ PATH_REMAPS = [
 ]
 
 # Reverb tail — only applied when cutting to end of track (HOTCUE_END = None).
-REVERB_TAIL      = False   # set True to append reverb decay after the cut point
-REVERB_ROOM_SIZE = 0.75    # 0.0–1.0
-REVERB_DAMPING   = 0.5     # 0.0–1.0
-REVERB_WET_LEVEL = 0.7     # 0.0–1.0  (tail amplitude)
-REVERB_WIDTH     = 1.0     # stereo width 0.0–1.0
-REVERB_TAIL_SECS = 4.0     # seconds of decay to append
+REVERB_TAIL       = False   # set True to append reverb decay after the cut point
+REVERB_ROOM_SIZE  = 0.75    # 0.0–1.0
+REVERB_DAMPING    = 0.5     # 0.0–1.0
+REVERB_WET_LEVEL  = 0.25    # 0.0–1.0  (tail amplitude)
+REVERB_WIDTH      = 1.0     # stereo width 0.0–1.0
+REVERB_TAIL_SECS  = 4.0     # seconds of decay to append
+REVERB_BLEND_SECS = 2.0     # seconds before cut over which reverb fades in
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MP3 constants
@@ -138,6 +140,36 @@ def read_id3v2_size(data):
         | (data[9] & 0x7F)
     )
     return size + 10
+
+
+def _patch_xing_header(frame_data, new_frame_count, new_byte_count):
+    """Update the Xing/Info VBR header inside an MP3 frame with new totals.
+    Returns patched bytes, or the original bytes unchanged if no header is found."""
+    if len(frame_data) < 4:
+        return frame_data
+    header = struct.unpack(">I", frame_data[:4])[0]
+    if (header >> 21) != 0x7FF:
+        return frame_data
+    version_bits = (header >> 19) & 0x03
+    layer_bits   = (header >> 17) & 0x03
+    version = {0: 2.5, 2: 2, 3: 1}.get(version_bits)
+    layer   = {1: 3, 2: 2, 3: 1}.get(layer_bits)
+    if layer != 3:
+        return frame_data
+    xing_off = 36 if version == 1 else 21  # 4-byte header + side-info bytes
+    if len(frame_data) < xing_off + 8:
+        return frame_data
+    if frame_data[xing_off:xing_off + 4] not in (b"Xing", b"Info"):
+        return frame_data
+    buf   = bytearray(frame_data)
+    flags = struct.unpack_from(">I", buf, xing_off + 4)[0]
+    pos   = xing_off + 8
+    if flags & 1:
+        struct.pack_into(">I", buf, pos, new_frame_count)
+        pos += 4
+    if flags & 2:
+        struct.pack_into(">I", buf, pos, new_byte_count)
+    return bytes(buf)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -259,6 +291,7 @@ def update_track_title(output_path, new_title):
             if audio.tags is None:
                 audio.add_tags()
             audio.tags.setall("TIT2", [TIT2(encoding=3, text=new_title)])
+            audio.tags.setall("TLEN", [TLEN(encoding=3, text=str(int(audio.info.length * 1000)))])
             audio.save(v2_version=3)
         elif ext == ".flac":
             audio = FLAC(output_path)
@@ -363,7 +396,7 @@ def cut_mp3(input_path, output_path, cut_start_samples, cut_end_samples, reverb_
         pre_cut_n = frames[best_start_idx][2]
         with PbAudioFile(input_path) as af:
             pre_pcm = af.read(pre_cut_n).T  # (n_samples, n_ch) float32
-        tail_pcm = _generate_reverb_tail(pre_pcm.astype(np.float64), file_sample_rate)
+        _, tail_pcm = _reverb_outro(pre_pcm.astype(np.float64), file_sample_rate, blend_in=False)
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
         os.close(tmp_fd)
         try:
@@ -380,11 +413,21 @@ def cut_mp3(input_path, output_path, cut_start_samples, cut_end_samples, reverb_
             tail_mp3_bytes = tail_mp3_bytes[:-128]
 
     # --- Pass 2: write kept frames --------------------------------------------
+    kept_frame_bytes = sum(frames[i][1] for i in range(len(frames))
+                           if i < best_start_idx or i >= end_idx)
+    new_frame_count = len(frames) - num_frames_to_cut
+    new_byte_count  = id3v2_size + kept_frame_bytes + len(tail_mp3_bytes) + len(id3v1_data)
+
     with open(output_path, "wb") as f:
         f.write(id3v2_data)
+        first_kept = True
         for i, (foff, fsize, _) in enumerate(frames):
             if i < best_start_idx or i >= end_idx:
-                f.write(data[foff : foff + fsize])
+                frame_bytes = data[foff : foff + fsize]
+                if first_kept:
+                    frame_bytes = _patch_xing_header(frame_bytes, new_frame_count, new_byte_count)
+                    first_kept = False
+                f.write(frame_bytes)
         if tail_mp3_bytes:
             f.write(tail_mp3_bytes)
         f.write(id3v1_data)
@@ -427,12 +470,18 @@ def _nearest_zero_crossing(mono, pos):
     return int(global_idx[np.argmin(np.abs(global_idx - pos))])
 
 
-def _generate_reverb_tail(pcm, sample_rate):
-    """Feed pcm ((n_samples, n_ch) float64) through reverb and return the decay tail.
+def _reverb_outro(pcm, sample_rate, blend_in=True):
+    """Process pre-cut PCM through reverb and return (modified_pre_cut, tail).
 
-    Builds reverb state from the pre-cut audio, then flushes with silence so only
-    the wet decay rings out — the pre-cut audio itself is kept lossless/untouched.
-    Returns float64 array of shape (tail_samples, n_ch).
+    When blend_in=True (FLAC/WAV): the reverb is gradually mixed into the last
+    REVERB_BLEND_SECS of modified_pre_cut so the transition sounds natural.
+    The tail then continues at the same level — no abrupt onset.
+
+    When blend_in=False (MP3, pre-cut frames kept lossless): modified_pre_cut is
+    the original pcm unchanged; the tail is faded in over REVERB_BLEND_SECS instead.
+
+    pcm: (n_samples, n_ch) float64
+    Returns: (modified_pre_cut, tail) both (n_samples, n_ch) float64.
     """
     if not _HAS_PEDALBOARD:
         sys.exit("Missing dependency: pedalboard\nInstall with: pip install pedalboard")
@@ -446,17 +495,30 @@ def _generate_reverb_tail(pcm, sample_rate):
     )])
 
     n_ch = pcm.shape[1] if pcm.ndim > 1 else 1
-    audio = (pcm if pcm.ndim > 1 else pcm[:, np.newaxis]).T.astype(np.float32)
-    board(audio, sample_rate, reset=True)   # build reverb state; output discarded
+    pcm_2d = pcm if pcm.ndim > 1 else pcm[:, np.newaxis]
+    audio_f32 = pcm_2d.T.astype(np.float32)  # (n_ch, n_samples)
 
+    reverb_out = board(audio_f32, sample_rate, reset=True)  # (n_ch, n_samples)
+
+    modified = pcm_2d.copy()  # (n_samples, n_ch)
+    if blend_in:
+        blend_n = min(len(modified), int(sample_rate * REVERB_BLEND_SECS))
+        ramp = np.linspace(0.0, 1.0, blend_n, dtype=np.float32)
+        modified[-blend_n:] += (reverb_out[:, -blend_n:].T * ramp[:, np.newaxis]).astype(np.float64)
+
+    # Flush reverb state with silence to get the decay tail
     tail_samples = int(sample_rate * REVERB_TAIL_SECS)
     silence = np.zeros((n_ch, tail_samples), dtype=np.float32)
     tail = board(silence, sample_rate, reset=False)  # (n_ch, tail_samples)
 
-    fade_len = min(tail.shape[1], int(sample_rate * 0.5))
-    tail[:, -fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+    if not blend_in:
+        fade_in_n = min(tail.shape[1], int(sample_rate * REVERB_BLEND_SECS))
+        tail[:, :fade_in_n] *= np.linspace(0.0, 1.0, fade_in_n, dtype=np.float32)
 
-    return tail.T.astype(np.float64)  # (tail_samples, n_ch)
+    fade_out_n = min(tail.shape[1], int(sample_rate * 0.5))
+    tail[:, -fade_out_n:] *= np.linspace(1.0, 0.0, fade_out_n, dtype=np.float32)
+
+    return modified.astype(np.float64), tail.T.astype(np.float64)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -493,8 +555,8 @@ def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples, reverb
     pre_cut = pcm[:snapped_start]
     if reverb_tail:
         print("  Generating reverb tail …", flush=True)
-        tail = _generate_reverb_tail(pre_cut, sample_rate)
-        kept = np.concatenate([pre_cut, tail])
+        pre_cut_blended, tail = _reverb_outro(pre_cut, sample_rate, blend_in=True)
+        kept = np.concatenate([pre_cut_blended, tail])
     else:
         tail = None
         kept = np.concatenate([pre_cut, pcm[snapped_end:]])
@@ -550,8 +612,8 @@ def cut_wav(input_path, output_path, cut_start_samples, cut_end_samples, reverb_
     pre_cut = pcm[:snapped_start]
     if reverb_tail:
         print("  Generating reverb tail …", flush=True)
-        tail = _generate_reverb_tail(pre_cut, sample_rate)
-        kept = np.concatenate([pre_cut, tail])
+        pre_cut_blended, tail = _reverb_outro(pre_cut, sample_rate, blend_in=True)
+        kept = np.concatenate([pre_cut_blended, tail])
     else:
         tail = None
         kept = np.concatenate([pre_cut, pcm[snapped_end:]])
@@ -652,6 +714,9 @@ def main():
         cut_wav(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
 
     update_track_title(output_filepath, output_title)
+
+    if sys.platform == "darwin":
+        subprocess.run(["mdimport", output_filepath], capture_output=True)
 
 
 if __name__ == "__main__":
