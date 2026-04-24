@@ -416,7 +416,7 @@ def cut_mp3(input_path, output_path, cut_start_samples, cut_end_samples, reverb_
     kept_frame_bytes = sum(frames[i][1] for i in range(len(frames))
                            if i < best_start_idx or i >= end_idx)
     new_frame_count = len(frames) - num_frames_to_cut
-    new_byte_count  = id3v2_size + kept_frame_bytes + len(tail_mp3_bytes) + len(id3v1_data)
+    new_byte_count  = kept_frame_bytes + len(tail_mp3_bytes)  # audio bytes only, no ID3 tags
 
     with open(output_path, "wb") as f:
         f.write(id3v2_data)
