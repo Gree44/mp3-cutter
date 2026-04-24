@@ -150,6 +150,25 @@ def _flac_crc8(data):
     return crc
 
 
+def _make_crc16_table():
+    t = []
+    for i in range(256):
+        crc = i << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x8005) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+        t.append(crc)
+    return t
+
+_FLAC_CRC16_TABLE = _make_crc16_table()
+
+
+def _flac_crc16(data):
+    crc = 0
+    for b in data:
+        crc = ((crc << 8) & 0xFFFF) ^ _FLAC_CRC16_TABLE[((crc >> 8) ^ b) & 0xFF]
+    return crc
+
+
 def _flac_read_utf8_int(data, pos):
     """Read UTF-8 coded unsigned int from FLAC frame header. Returns (value, new_pos) or (None, pos)."""
     if pos >= len(data):
@@ -171,6 +190,31 @@ def _flac_read_utf8_int(data, pos):
             return None, pos
         val = (val << 6) | (cb & 0x3F)
     return val, pos + n
+
+
+def _flac_write_utf8_int(value):
+    """Encode a non-negative integer as a FLAC-style UTF-8 variable-length integer."""
+    if value < 0x80:
+        return bytes([value])
+    elif value < 0x800:
+        return bytes([0xC0 | (value >> 6), 0x80 | (value & 0x3F)])
+    elif value < 0x10000:
+        return bytes([0xE0 | (value >> 12), 0x80 | ((value >> 6) & 0x3F), 0x80 | (value & 0x3F)])
+    elif value < 0x200000:
+        return bytes([0xF0 | (value >> 18), 0x80 | ((value >> 12) & 0x3F),
+                      0x80 | ((value >> 6) & 0x3F), 0x80 | (value & 0x3F)])
+    elif value < 0x4000000:
+        return bytes([0xF8 | (value >> 24), 0x80 | ((value >> 18) & 0x3F),
+                      0x80 | ((value >> 12) & 0x3F), 0x80 | ((value >> 6) & 0x3F),
+                      0x80 | (value & 0x3F)])
+    elif value < 0x80000000:
+        return bytes([0xFC | (value >> 30), 0x80 | ((value >> 24) & 0x3F),
+                      0x80 | ((value >> 18) & 0x3F), 0x80 | ((value >> 12) & 0x3F),
+                      0x80 | ((value >> 6) & 0x3F), 0x80 | (value & 0x3F)])
+    else:
+        return bytes([0xFE, 0x80 | ((value >> 30) & 0x3F), 0x80 | ((value >> 24) & 0x3F),
+                      0x80 | ((value >> 18) & 0x3F), 0x80 | ((value >> 12) & 0x3F),
+                      0x80 | ((value >> 6) & 0x3F), 0x80 | (value & 0x3F)])
 
 
 def _parse_flac_frame_header(data, pos):
@@ -233,6 +277,41 @@ def _parse_flac_frame_header(data, pos):
         return None
 
     return {"block_size": block_size, "header_end": p + 1}
+
+
+def _patch_flac_frame_number(frame_bytes, new_number):
+    """
+    Rewrite the frame/sample number in a FLAC frame header and update CRC-8 and CRC-16.
+    Handles the case where the new UTF-8 encoding is a different length than the original.
+    Returns patched bytes, or None if the header can't be parsed.
+    """
+    result = _parse_flac_frame_header(frame_bytes, 0)
+    if result is None:
+        return None
+    crc8_pos = result["header_end"] - 1
+
+    # Length of the original UTF-8 number (read from the leading byte at offset 4)
+    b0 = frame_bytes[4]
+    if not (b0 & 0x80):
+        old_len = 1
+    else:
+        n, tmp = 0, b0
+        while tmp & 0x80:
+            n += 1
+            tmp = (tmp << 1) & 0xFF
+        old_len = n
+
+    new_encoded = _flac_write_utf8_int(new_number)
+
+    # Rebuild: [4 fixed bytes] [new number] [optional header bytes] [crc8] [audio] [crc16]
+    optional_bytes = bytes(frame_bytes[4 + old_len: crc8_pos])
+    audio_payload = bytes(frame_bytes[crc8_pos + 1: -2])
+
+    header_body = bytes(frame_bytes[0:4]) + new_encoded + optional_bytes
+    new_crc8 = _flac_crc8(header_body)
+    frame = header_body + bytes([new_crc8]) + audio_payload
+    new_crc16 = _flac_crc16(frame)
+    return frame + bytes([(new_crc16 >> 8) & 0xFF, new_crc16 & 0xFF])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -526,6 +605,30 @@ def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples):
                 continue
         p += 1
 
+    # Discard false-positive sync matches by validating CRC-16 of each frame.
+    # A false positive inside a real frame causes the real frame to appear truncated
+    # (bad CRC-16) followed by an extra short entry. Merge the pair back together.
+    cleaned = []
+    i = 0
+    while i < len(frame_starts):
+        fpos, bs = frame_starts[i]
+        next_pos = frame_starts[i + 1][0] if i + 1 < len(frame_starts) else len(data)
+        frame_data = data[fpos:next_pos]
+        expected_crc16 = (frame_data[-2] << 8) | frame_data[-1]
+        if _flac_crc16(frame_data[:-2]) != expected_crc16 and i + 1 < len(frame_starts):
+            # Bad CRC-16: the next entry is a false positive inside this frame.
+            # Extend to the entry after the false positive.
+            skip_pos = frame_starts[i + 2][0] if i + 2 < len(frame_starts) else len(data)
+            merged_data = data[fpos:skip_pos]
+            merged_crc16 = (merged_data[-2] << 8) | merged_data[-1]
+            if _flac_crc16(merged_data[:-2]) == merged_crc16:
+                cleaned.append((fpos, bs))
+                i += 2  # skip the false-positive entry
+                continue
+        cleaned.append((fpos, bs))
+        i += 1
+    frame_starts = cleaned
+
     if not frame_starts:
         print("Error: No valid FLAC frames found.")
         sys.exit(1)
@@ -539,6 +642,9 @@ def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples):
         current_sample += block_size
 
     spf = frames[0][3]  # typical samples per frame (from first frame)
+
+    # Detect fixed (0) vs variable (1) blocksize — needed for correct renumbering
+    blocking_strategy = data[frames[0][0] + 1] & 0x01
 
     # --- Determine optimal cut region (same logic as MP3) ---
     desired_length = cut_end_samples - cut_start_samples
@@ -577,9 +683,22 @@ def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples):
             f.write(bytes([is_last_out << 7 | btype]))
             f.write(bytes([(len(bdata) >> 16) & 0xFF, (len(bdata) >> 8) & 0xFF, len(bdata) & 0xFF]))
             f.write(bdata)
-        for i, (foff, fsize, _, _) in enumerate(frames):
-            if i < best_start_idx or i >= end_idx:
-                f.write(data[foff: foff + fsize])
+        renumber_skipped = 0
+        for i, (foff, fsize, fsample, _) in enumerate(frames):
+            if best_start_idx <= i < end_idx:
+                continue
+            frame_bytes = data[foff: foff + fsize]
+            if i >= end_idx:
+                # Fix frame/sample number so the sequence is contiguous after the cut
+                new_num = (i - num_frames_to_cut) if blocking_strategy == 0 else (fsample - actual_length)
+                patched = _patch_flac_frame_number(frame_bytes, new_num)
+                if patched is not None:
+                    frame_bytes = patched
+                else:
+                    renumber_skipped += 1
+            f.write(frame_bytes)
+    if renumber_skipped:
+        print(f"  Warning: {renumber_skipped} frames could not be renumbered (header parse failed).")
 
     print(f"\n  Total frames  : {len(frames)}")
     print(f"  Cut frames    : {num_frames_to_cut}")
