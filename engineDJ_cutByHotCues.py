@@ -10,12 +10,20 @@ import sqlite3
 import zlib
 import os
 import sys
+import tempfile
 
 try:
     import numpy as np
     import soundfile as sf
 except ImportError as exc:
     sys.exit(f"Missing dependency: {exc}\nInstall with: pip install soundfile numpy")
+
+try:
+    from pedalboard import Pedalboard, Reverb as PbReverb
+    from pedalboard.io import AudioFile as PbAudioFile
+    _HAS_PEDALBOARD = True
+except ImportError:
+    _HAS_PEDALBOARD = False
 
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TIT2
@@ -37,6 +45,14 @@ ENGINE_DB_PATH = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
 PATH_REMAPS = [
     ("~/Music/OneDrive", "~/Library/CloudStorage/OneDrive-Personal"),
 ]
+
+# Reverb tail — only applied when cutting to end of track (HOTCUE_END = None).
+REVERB_TAIL      = False   # set True to append reverb decay after the cut point
+REVERB_ROOM_SIZE = 0.75    # 0.0–1.0
+REVERB_DAMPING   = 0.5     # 0.0–1.0
+REVERB_WET_LEVEL = 0.7     # 0.0–1.0  (tail amplitude)
+REVERB_WIDTH     = 1.0     # stereo width 0.0–1.0
+REVERB_TAIL_SECS = 4.0     # seconds of decay to append
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MP3 constants
@@ -266,13 +282,15 @@ def update_track_title(output_path, new_title):
 # Frame-accurate MP3 cutting
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def cut_mp3(input_path, output_path, cut_start_samples, cut_end_samples):
+def cut_mp3(input_path, output_path, cut_start_samples, cut_end_samples, reverb_tail=False):
     """
     Remove a run of MP3 frames that best matches the region [cut_start, cut_end).
     The cut start snaps to the nearest frame boundary, and the number of frames
     removed is chosen so that the total cut length (in samples) stays as close
     as possible to the desired length — preserving beat-grid alignment.
-    Preserves ID3v2/v1 tags and does not re-encode.
+    Preserves ID3v2/v1 tags and does not re-encode the kept frames.
+    When reverb_tail=True the removed section is replaced with a reverb decay tail
+    (decoded from the kept frames, re-encoded as new MP3 frames).
     """
     with open(input_path, "rb") as f:
         data = f.read()
@@ -336,21 +354,53 @@ def cut_mp3(input_path, output_path, cut_start_samples, cut_end_samples):
     actual_length = actual_end_sample - actual_start_sample
     drift = actual_length - desired_length
 
+    # --- Generate reverb tail (MP3 only, decoded → reverb → re-encoded) -------
+    tail_mp3_bytes = b""
+    if reverb_tail:
+        if not _HAS_PEDALBOARD:
+            sys.exit("Missing dependency: pedalboard\nInstall with: pip install pedalboard")
+        print("  Generating reverb tail …", flush=True)
+        pre_cut_n = frames[best_start_idx][2]
+        with PbAudioFile(input_path) as af:
+            pre_pcm = af.read(pre_cut_n).T  # (n_samples, n_ch) float32
+        tail_pcm = _generate_reverb_tail(pre_pcm.astype(np.float64), file_sample_rate)
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(tmp_fd)
+        try:
+            with PbAudioFile(tmp_path, "w", samplerate=file_sample_rate,
+                             num_channels=tail_pcm.shape[1]) as af:
+                af.write(tail_pcm.T.astype(np.float32))
+            with open(tmp_path, "rb") as f:
+                raw = f.read()
+        finally:
+            os.unlink(tmp_path)
+        tail_start = read_id3v2_size(raw)
+        tail_mp3_bytes = raw[tail_start:]
+        if len(tail_mp3_bytes) >= 128 and tail_mp3_bytes[-128:-125] == b"TAG":
+            tail_mp3_bytes = tail_mp3_bytes[:-128]
+
     # --- Pass 2: write kept frames --------------------------------------------
     with open(output_path, "wb") as f:
         f.write(id3v2_data)
         for i, (foff, fsize, _) in enumerate(frames):
             if i < best_start_idx or i >= end_idx:
                 f.write(data[foff : foff + fsize])
+        if tail_mp3_bytes:
+            f.write(tail_mp3_bytes)
         f.write(id3v1_data)
 
     sr = file_sample_rate or 44100
+    kept_dur = best_start_idx * spf / sr
     print(f"\n  Total frames  : {len(frames)}")
     print(f"  Cut frames    : {num_frames_to_cut}")
     print(f"  Desired cut   : {desired_length:.0f} samples ({desired_length / sr:.3f} s)")
     print(f"  Actual cut    : {actual_length:.0f} samples ({actual_length / sr:.3f} s)")
     print(f"  Drift         : {drift:+.0f} samples ({drift / sr * 1000:+.2f} ms)")
-    print(f"  New duration  : ~{(len(frames) - num_frames_to_cut) * spf / sr:.2f} s")
+    if reverb_tail:
+        print(f"  New duration  : ~{kept_dur + REVERB_TAIL_SECS:.2f} s")
+        print(f"  Reverb tail   : {REVERB_TAIL_SECS:.1f} s ({len(tail_mp3_bytes) / 1024:.1f} KB)")
+    else:
+        print(f"  New duration  : ~{(len(frames) - num_frames_to_cut) * spf / sr:.2f} s")
     print(f"  Output file   : {output_path}")
 
 
@@ -377,16 +427,49 @@ def _nearest_zero_crossing(mono, pos):
     return int(global_idx[np.argmin(np.abs(global_idx - pos))])
 
 
+def _generate_reverb_tail(pcm, sample_rate):
+    """Feed pcm ((n_samples, n_ch) float64) through reverb and return the decay tail.
+
+    Builds reverb state from the pre-cut audio, then flushes with silence so only
+    the wet decay rings out — the pre-cut audio itself is kept lossless/untouched.
+    Returns float64 array of shape (tail_samples, n_ch).
+    """
+    if not _HAS_PEDALBOARD:
+        sys.exit("Missing dependency: pedalboard\nInstall with: pip install pedalboard")
+
+    board = Pedalboard([PbReverb(
+        room_size=REVERB_ROOM_SIZE,
+        damping=REVERB_DAMPING,
+        wet_level=REVERB_WET_LEVEL,
+        dry_level=0.0,
+        width=REVERB_WIDTH,
+    )])
+
+    n_ch = pcm.shape[1] if pcm.ndim > 1 else 1
+    audio = (pcm if pcm.ndim > 1 else pcm[:, np.newaxis]).T.astype(np.float32)
+    board(audio, sample_rate, reset=True)   # build reverb state; output discarded
+
+    tail_samples = int(sample_rate * REVERB_TAIL_SECS)
+    silence = np.zeros((n_ch, tail_samples), dtype=np.float32)
+    tail = board(silence, sample_rate, reset=False)  # (n_ch, tail_samples)
+
+    fade_len = min(tail.shape[1], int(sample_rate * 0.5))
+    tail[:, -fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+
+    return tail.T.astype(np.float64)  # (tail_samples, n_ch)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Sample-accurate FLAC cutting
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples):
+def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples, reverb_tail=False):
     """
     Remove exact samples [cut_start, cut_end) from a FLAC file.
     Both cut points are snapped to the nearest zero crossing (within ±11 ms)
     to eliminate clicks at the splice. Re-encodes losslessly via soundfile;
     decoded audio for kept samples is bit-for-bit identical to the original.
+    When reverb_tail=True the post-cut silence is replaced with a reverb decay.
     """
     info = sf.info(input_path)
     sample_rate = info.samplerate
@@ -406,9 +489,16 @@ def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples):
     desired_length = cut_end_samples - cut_start_samples
     actual_length  = snapped_end - snapped_start
     drift          = actual_length - desired_length
-    new_total      = total_samples - actual_length
 
-    kept = np.concatenate([pcm[:snapped_start], pcm[snapped_end:]])
+    pre_cut = pcm[:snapped_start]
+    if reverb_tail:
+        print("  Generating reverb tail …", flush=True)
+        tail = _generate_reverb_tail(pre_cut, sample_rate)
+        kept = np.concatenate([pre_cut, tail])
+    else:
+        tail = None
+        kept = np.concatenate([pre_cut, pcm[snapped_end:]])
+
     sf.write(output_path, kept, sample_rate, subtype=subtype, format="FLAC")
 
     zc_start_shift = snapped_start - start
@@ -416,11 +506,14 @@ def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples):
 
     print(f"\n  Total samples : {total_samples}")
     print(f"  ZC snap (start): {zc_start_shift:+d} samples ({zc_start_shift / sample_rate * 1000:+.2f} ms)")
-    print(f"  ZC snap (end)  : {zc_end_shift:+d} samples ({zc_end_shift / sample_rate * 1000:+.2f} ms)")
+    if not reverb_tail:
+        print(f"  ZC snap (end)  : {zc_end_shift:+d} samples ({zc_end_shift / sample_rate * 1000:+.2f} ms)")
     print(f"  Desired cut   : {desired_length:.0f} samples ({desired_length / sample_rate:.3f} s)")
     print(f"  Actual cut    : {actual_length} samples ({actual_length / sample_rate:.3f} s)")
     print(f"  Drift         : {drift:+.0f} samples ({drift / sample_rate * 1000:+.2f} ms)")
-    print(f"  New duration  : ~{new_total / sample_rate:.2f} s")
+    print(f"  New duration  : ~{len(kept) / sample_rate:.2f} s")
+    if reverb_tail:
+        print(f"  Reverb tail   : {len(tail) / sample_rate:.2f} s")
     print(f"  Output file   : {output_path}")
 
 
@@ -428,11 +521,12 @@ def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples):
 # Sample-accurate WAV cutting
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def cut_wav(input_path, output_path, cut_start_samples, cut_end_samples):
+def cut_wav(input_path, output_path, cut_start_samples, cut_end_samples, reverb_tail=False):
     """
     Remove exact samples [cut_start, cut_end) from a WAV file.
     Both cut points are snapped to the nearest zero crossing (within ±11 ms)
     to eliminate clicks at the splice. No re-encoding needed (WAV is uncompressed).
+    When reverb_tail=True the post-cut silence is replaced with a reverb decay.
     """
     info = sf.info(input_path)
     sample_rate = info.samplerate
@@ -452,9 +546,16 @@ def cut_wav(input_path, output_path, cut_start_samples, cut_end_samples):
     desired_length = cut_end_samples - cut_start_samples
     actual_length  = snapped_end - snapped_start
     drift          = actual_length - desired_length
-    new_total      = total_samples - actual_length
 
-    kept = np.concatenate([pcm[:snapped_start], pcm[snapped_end:]])
+    pre_cut = pcm[:snapped_start]
+    if reverb_tail:
+        print("  Generating reverb tail …", flush=True)
+        tail = _generate_reverb_tail(pre_cut, sample_rate)
+        kept = np.concatenate([pre_cut, tail])
+    else:
+        tail = None
+        kept = np.concatenate([pre_cut, pcm[snapped_end:]])
+
     sf.write(output_path, kept, sample_rate, subtype=subtype, format="WAV")
 
     zc_start_shift = snapped_start - start
@@ -462,11 +563,14 @@ def cut_wav(input_path, output_path, cut_start_samples, cut_end_samples):
 
     print(f"\n  Total samples : {total_samples}")
     print(f"  ZC snap (start): {zc_start_shift:+d} samples ({zc_start_shift / sample_rate * 1000:+.2f} ms)")
-    print(f"  ZC snap (end)  : {zc_end_shift:+d} samples ({zc_end_shift / sample_rate * 1000:+.2f} ms)")
+    if not reverb_tail:
+        print(f"  ZC snap (end)  : {zc_end_shift:+d} samples ({zc_end_shift / sample_rate * 1000:+.2f} ms)")
     print(f"  Desired cut   : {desired_length:.0f} samples ({desired_length / sample_rate:.3f} s)")
     print(f"  Actual cut    : {actual_length} samples ({actual_length / sample_rate:.3f} s)")
     print(f"  Drift         : {drift:+.0f} samples ({drift / sample_rate * 1000:+.2f} ms)")
-    print(f"  New duration  : ~{new_total / sample_rate:.2f} s")
+    print(f"  New duration  : ~{len(kept) / sample_rate:.2f} s")
+    if reverb_tail:
+        print(f"  Reverb tail   : {len(tail) / sample_rate:.2f} s")
     print(f"  Output file   : {output_path}")
 
 
@@ -537,12 +641,15 @@ def main():
         print(f"\nCutting from Cue {HOTCUE_START} to end of track …")
     else:
         print(f"\nCutting between Cue {HOTCUE_START} and Cue {HOTCUE_END} …")
+
+    add_reverb = REVERB_TAIL and (HOTCUE_END is None)
+
     if ext_lower == ".mp3":
-        cut_mp3(track_abs_path, output_filepath, cut_start, cut_end)
+        cut_mp3(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
     elif ext_lower == ".flac":
-        cut_flac(track_abs_path, output_filepath, cut_start, cut_end)
+        cut_flac(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
     else:
-        cut_wav(track_abs_path, output_filepath, cut_start, cut_end)
+        cut_wav(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
 
     update_track_title(output_filepath, output_title)
 
