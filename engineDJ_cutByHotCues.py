@@ -10,6 +10,10 @@ import zlib
 import os
 import sys
 import wave
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3, TIT2
+from mutagen.mp3 import MP3
+from mutagen.wave import WAVE
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION — Edit these variables before running
@@ -19,7 +23,7 @@ TRACK_FILENAME = "01 - Titanium (feat. Sia) (Extended).flac"  # supports .mp3, .
 HOTCUE_START = 5          # Hotcue number (1–8) — cut begins here
 HOTCUE_END = 6            # Hotcue number (1–8) — cut ends here
 OUTPUT_APPENDIX = "(Short Edit)"
-OUTPUT_PATH = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_PATH = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
 ENGINE_DB_PATH = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
 
 # Remap stale Engine DJ paths to their current locations when files have moved.
@@ -337,6 +341,39 @@ def resolve_track_path(db_path, relative_path):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Metadata updates
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def update_track_title(output_path, new_title):
+    """Update the embedded track title tag for supported output formats."""
+    ext = os.path.splitext(output_path)[1].lower()
+
+    try:
+        if ext == ".mp3":
+            audio = MP3(output_path, ID3=ID3)
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags.setall("TIT2", [TIT2(encoding=3, text=new_title)])
+            audio.save(v2_version=3)
+        elif ext == ".flac":
+            audio = FLAC(output_path)
+            audio["title"] = [new_title]
+            audio.save()
+        elif ext == ".wav":
+            audio = WAVE(output_path)
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags.setall("TIT2", [TIT2(encoding=3, text=new_title)])
+            audio.save(v2_version=3)
+        else:
+            return
+
+        print(f"  Track title   : {new_title}")
+    except Exception as exc:
+        print(f"Warning: Could not update track title metadata: {exc}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Frame-accurate MP3 cutting
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -642,7 +679,9 @@ def main():
         print(f"Error: Unsupported file format '{ext}'. Supported: .mp3, .flac, .wav")
         sys.exit(1)
 
-    output_filename = f"{name} {OUTPUT_APPENDIX}{ext}"
+    output_title = f"{name} {OUTPUT_APPENDIX}"
+    output_filename = f"{output_title}{ext}"
+    os.makedirs(OUTPUT_PATH, exist_ok=True)
     output_filepath = os.path.join(OUTPUT_PATH, output_filename)
 
     print(f"\nCutting between Cue {HOTCUE_START} and Cue {HOTCUE_END} …")
@@ -652,6 +691,8 @@ def main():
         cut_flac(track_abs_path, output_filepath, cut_start, cut_end)
     else:
         cut_wav(track_abs_path, output_filepath, cut_start, cut_end)
+
+    update_track_title(output_filepath, output_title)
 
 
 if __name__ == "__main__":
