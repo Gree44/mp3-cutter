@@ -281,6 +281,31 @@ def resolve_track_path(db_path, relative_path):
 # Metadata updates
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _copy_metadata(src_path, dst_path, ext):
+    """Copy all embedded tags and artwork from src to dst (FLAC and WAV only)."""
+    try:
+        if ext == ".flac":
+            src = FLAC(src_path)
+            dst = FLAC(dst_path)
+            if src.tags:
+                for key, values in src.tags.as_dict().items():
+                    dst[key] = values
+            for pic in src.pictures:
+                dst.add_picture(pic)
+            dst.save()
+        elif ext == ".wav":
+            src = WAVE(src_path)
+            if src.tags:
+                dst = WAVE(dst_path)
+                if dst.tags is None:
+                    dst.add_tags()
+                for frame in src.tags.values():
+                    dst.tags.add(frame)
+                dst.save()
+    except Exception as exc:
+        print(f"Warning: Could not copy metadata: {exc}")
+
+
 def update_track_title(output_path, new_title):
     """Update the embedded track title tag for supported output formats."""
     ext = os.path.splitext(output_path)[1].lower()
@@ -562,6 +587,7 @@ def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples, reverb
         kept = np.concatenate([pre_cut, pcm[snapped_end:]])
 
     sf.write(output_path, kept, sample_rate, subtype=subtype, format="FLAC")
+    _copy_metadata(input_path, output_path, ".flac")
 
     zc_start_shift = snapped_start - start
     zc_end_shift   = snapped_end   - end
@@ -619,6 +645,7 @@ def cut_wav(input_path, output_path, cut_start_samples, cut_end_samples, reverb_
         kept = np.concatenate([pre_cut, pcm[snapped_end:]])
 
     sf.write(output_path, kept, sample_rate, subtype=subtype, format="WAV")
+    _copy_metadata(input_path, output_path, ".wav")
 
     zc_start_shift = snapped_start - start
     zc_end_shift   = snapped_end   - end
