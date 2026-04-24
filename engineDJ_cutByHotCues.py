@@ -28,7 +28,7 @@ from mutagen.wave import WAVE
 
 TRACK_FILENAME = "01 - Titanium (feat. Sia) (Extended).flac"  # supports .mp3, .flac, .wav
 HOTCUE_START = 5          # Hotcue number (1–8) — cut begins here
-HOTCUE_END = 6            # Hotcue number (1–8) — cut ends here
+HOTCUE_END = 6            # Hotcue number (1–8) — cut ends here; set to None to cut to end of track
 OUTPUT_APPENDIX = "(Short Edit)"
 OUTPUT_PATH = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
 ENGINE_DB_PATH = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
@@ -498,35 +498,45 @@ def main():
         remainder = secs - mins * 60
         print(f"    Cue {num}:  {mins}:{remainder:05.2f}  ({hotcues[num]:.0f} samples)")
 
-    if HOTCUE_START not in hotcues:
-        print(f"\nError: Hotcue {HOTCUE_START} is not set on this track.")
-        sys.exit(1)
-    if HOTCUE_END not in hotcues:
-        print(f"\nError: Hotcue {HOTCUE_END} is not set on this track.")
-        sys.exit(1)
-
-    cut_start = hotcues[HOTCUE_START]
-    cut_end = hotcues[HOTCUE_END]
-
-    if cut_start >= cut_end:
-        print(
-            f"\nError: Hotcue {HOTCUE_START} ({cut_start:.0f} samples) must be "
-            f"before Hotcue {HOTCUE_END} ({cut_end:.0f} samples)."
-        )
-        sys.exit(1)
-
     name, ext = os.path.splitext(track_fn)
     ext_lower = ext.lower()
     if ext_lower not in (".mp3", ".flac", ".wav"):
         print(f"Error: Unsupported file format '{ext}'. Supported: .mp3, .flac, .wav")
         sys.exit(1)
 
+    if HOTCUE_START not in hotcues:
+        print(f"\nError: Hotcue {HOTCUE_START} is not set on this track.")
+        sys.exit(1)
+
+    cut_start = hotcues[HOTCUE_START]
+
+    if HOTCUE_END is None:
+        if ext_lower in (".flac", ".wav"):
+            cut_end = sf.info(track_abs_path).frames
+        else:
+            mp3 = MP3(track_abs_path)
+            cut_end = int(mp3.info.length * mp3.info.sample_rate)
+    else:
+        if HOTCUE_END not in hotcues:
+            print(f"\nError: Hotcue {HOTCUE_END} is not set on this track.")
+            sys.exit(1)
+        cut_end = hotcues[HOTCUE_END]
+        if cut_start >= cut_end:
+            print(
+                f"\nError: Hotcue {HOTCUE_START} ({cut_start:.0f} samples) must be "
+                f"before Hotcue {HOTCUE_END} ({cut_end:.0f} samples)."
+            )
+            sys.exit(1)
+
     output_title = f"{name} {OUTPUT_APPENDIX}"
     output_filename = f"{output_title}{ext}"
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     output_filepath = os.path.join(OUTPUT_PATH, output_filename)
 
-    print(f"\nCutting between Cue {HOTCUE_START} and Cue {HOTCUE_END} …")
+    if HOTCUE_END is None:
+        print(f"\nCutting from Cue {HOTCUE_START} to end of track …")
+    else:
+        print(f"\nCutting between Cue {HOTCUE_START} and Cue {HOTCUE_END} …")
     if ext_lower == ".mp3":
         cut_mp3(track_abs_path, output_filepath, cut_start, cut_end)
     elif ext_lower == ".flac":
