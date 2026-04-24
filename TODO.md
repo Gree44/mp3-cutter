@@ -1,0 +1,3 @@
+- Redo Titanium for metadata
+- let claude compare both titanium files - soundwave preview differs
+- Toxic reverb
