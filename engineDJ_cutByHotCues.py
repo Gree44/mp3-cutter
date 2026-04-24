@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Audio Cutter — Cut sections from MP3, FLAC, or WAV files using Engine DJ hotcues.
-Removes audio between two hotcue positions without re-encoding.
+Removes audio between two hotcue positions. FLAC and WAV are cut sample-accurately
+with zero-crossing snap; MP3 is cut frame-accurately (lossless, no re-encoding).
 """
 
 import struct
@@ -9,7 +10,13 @@ import sqlite3
 import zlib
 import os
 import sys
-import wave
+
+try:
+    import numpy as np
+    import soundfile as sf
+except ImportError as exc:
+    sys.exit(f"Missing dependency: {exc}\nInstall with: pip install soundfile numpy")
+
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TIT2
 from mutagen.mp3 import MP3
@@ -115,203 +122,6 @@ def read_id3v2_size(data):
         | (data[9] & 0x7F)
     )
     return size + 10
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# FLAC constants and utilities
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _make_crc8_table():
-    t = []
-    for i in range(256):
-        c = i
-        for _ in range(8):
-            c = ((c << 1) ^ 0x07) & 0xFF if c & 0x80 else (c << 1) & 0xFF
-        t.append(c)
-    return bytes(t)
-
-_FLAC_CRC8_TABLE = _make_crc8_table()
-
-FLAC_BLOCK_SIZE_TABLE = {
-    0x00: None,   # reserved
-    0x01: 192,
-    0x02: 576, 0x03: 1152, 0x04: 2304, 0x05: 4608,
-    0x06: None,   # 8-bit value follows header
-    0x07: None,   # 16-bit value follows header
-    0x08: 256,  0x09: 512,  0x0A: 1024, 0x0B: 2048,
-    0x0C: 4096, 0x0D: 8192, 0x0E: 16384, 0x0F: 32768,
-}
-
-
-def _flac_crc8(data):
-    crc = 0
-    for b in data:
-        crc = _FLAC_CRC8_TABLE[crc ^ b]
-    return crc
-
-
-def _make_crc16_table():
-    t = []
-    for i in range(256):
-        crc = i << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x8005) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
-        t.append(crc)
-    return t
-
-_FLAC_CRC16_TABLE = _make_crc16_table()
-
-
-def _flac_crc16(data):
-    crc = 0
-    for b in data:
-        crc = ((crc << 8) & 0xFFFF) ^ _FLAC_CRC16_TABLE[((crc >> 8) ^ b) & 0xFF]
-    return crc
-
-
-def _flac_read_utf8_int(data, pos):
-    """Read UTF-8 coded unsigned int from FLAC frame header. Returns (value, new_pos) or (None, pos)."""
-    if pos >= len(data):
-        return None, pos
-    b0 = data[pos]
-    if not (b0 & 0x80):
-        return b0, pos + 1
-    n = 0
-    tmp = b0
-    while tmp & 0x80:
-        n += 1
-        tmp = (tmp << 1) & 0xFF
-    if n < 2 or n > 7 or pos + n > len(data):
-        return None, pos
-    val = b0 & (0x7F >> n)
-    for i in range(1, n):
-        cb = data[pos + i]
-        if (cb & 0xC0) != 0x80:
-            return None, pos
-        val = (val << 6) | (cb & 0x3F)
-    return val, pos + n
-
-
-def _flac_write_utf8_int(value):
-    """Encode a non-negative integer as a FLAC-style UTF-8 variable-length integer."""
-    if value < 0x80:
-        return bytes([value])
-    elif value < 0x800:
-        return bytes([0xC0 | (value >> 6), 0x80 | (value & 0x3F)])
-    elif value < 0x10000:
-        return bytes([0xE0 | (value >> 12), 0x80 | ((value >> 6) & 0x3F), 0x80 | (value & 0x3F)])
-    elif value < 0x200000:
-        return bytes([0xF0 | (value >> 18), 0x80 | ((value >> 12) & 0x3F),
-                      0x80 | ((value >> 6) & 0x3F), 0x80 | (value & 0x3F)])
-    elif value < 0x4000000:
-        return bytes([0xF8 | (value >> 24), 0x80 | ((value >> 18) & 0x3F),
-                      0x80 | ((value >> 12) & 0x3F), 0x80 | ((value >> 6) & 0x3F),
-                      0x80 | (value & 0x3F)])
-    elif value < 0x80000000:
-        return bytes([0xFC | (value >> 30), 0x80 | ((value >> 24) & 0x3F),
-                      0x80 | ((value >> 18) & 0x3F), 0x80 | ((value >> 12) & 0x3F),
-                      0x80 | ((value >> 6) & 0x3F), 0x80 | (value & 0x3F)])
-    else:
-        return bytes([0xFE, 0x80 | ((value >> 30) & 0x3F), 0x80 | ((value >> 24) & 0x3F),
-                      0x80 | ((value >> 18) & 0x3F), 0x80 | ((value >> 12) & 0x3F),
-                      0x80 | ((value >> 6) & 0x3F), 0x80 | (value & 0x3F)])
-
-
-def _parse_flac_frame_header(data, pos):
-    """
-    Parse FLAC frame header at data[pos]. Validates CRC-8.
-    Returns dict with block_size and header_end offset, or None if invalid.
-    """
-    if pos + 5 > len(data):
-        return None
-    # Sync word: 14 bits 0x3FFE, then reserved=0, then blocking_strategy
-    if data[pos] != 0xFF or (data[pos + 1] & 0xFE) != 0xF8:
-        return None
-
-    byte2 = data[pos + 2]
-    byte3 = data[pos + 3]
-
-    if byte3 & 0x01:  # reserved bit must be 0
-        return None
-
-    block_size_bits = (byte2 >> 4) & 0x0F
-    sample_rate_bits = byte2 & 0x0F
-
-    if sample_rate_bits == 0x0F:  # invalid
-        return None
-
-    p = pos + 4
-
-    # UTF-8 coded frame/sample number
-    val, p = _flac_read_utf8_int(data, p)
-    if val is None:
-        return None
-
-    # Optional block size
-    if block_size_bits == 0x06:
-        if p >= len(data):
-            return None
-        block_size = data[p] + 1
-        p += 1
-    elif block_size_bits == 0x07:
-        if p + 1 >= len(data):
-            return None
-        block_size = struct.unpack(">H", data[p:p + 2])[0] + 1
-        p += 2
-    else:
-        block_size = FLAC_BLOCK_SIZE_TABLE.get(block_size_bits)
-        if block_size is None:
-            return None
-
-    # Optional sample rate bytes
-    if sample_rate_bits == 0x0C:
-        p += 1
-    elif sample_rate_bits in (0x0D, 0x0E):
-        p += 2
-
-    if p >= len(data):
-        return None
-
-    # CRC-8 covers everything from sync to here (exclusive of crc byte itself)
-    if _flac_crc8(data[pos:p]) != data[p]:
-        return None
-
-    return {"block_size": block_size, "header_end": p + 1}
-
-
-def _patch_flac_frame_number(frame_bytes, new_number):
-    """
-    Rewrite the frame/sample number in a FLAC frame header and update CRC-8 and CRC-16.
-    Handles the case where the new UTF-8 encoding is a different length than the original.
-    Returns patched bytes, or None if the header can't be parsed.
-    """
-    result = _parse_flac_frame_header(frame_bytes, 0)
-    if result is None:
-        return None
-    crc8_pos = result["header_end"] - 1
-
-    # Length of the original UTF-8 number (read from the leading byte at offset 4)
-    b0 = frame_bytes[4]
-    if not (b0 & 0x80):
-        old_len = 1
-    else:
-        n, tmp = 0, b0
-        while tmp & 0x80:
-            n += 1
-            tmp = (tmp << 1) & 0xFF
-        old_len = n
-
-    new_encoded = _flac_write_utf8_int(new_number)
-
-    # Rebuild: [4 fixed bytes] [new number] [optional header bytes] [crc8] [audio] [crc16]
-    optional_bytes = bytes(frame_bytes[4 + old_len: crc8_pos])
-    audio_payload = bytes(frame_bytes[crc8_pos + 1: -2])
-
-    header_body = bytes(frame_bytes[0:4]) + new_encoded + optional_bytes
-    new_crc8 = _flac_crc8(header_body)
-    frame = header_body + bytes([new_crc8]) + audio_payload
-    new_crc16 = _flac_crc16(frame)
-    return frame + bytes([(new_crc16 >> 8) & 0xFF, new_crc16 & 0xFF])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -545,167 +355,72 @@ def cut_mp3(input_path, output_path, cut_start_samples, cut_end_samples):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Frame-accurate FLAC cutting
+# Zero-crossing helper (shared by FLAC and WAV)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ZC_WINDOW = 500  # samples to search either side of the target position
+
+def _nearest_zero_crossing(mono, pos):
+    """Return the nearest zero-crossing index to pos within ±_ZC_WINDOW samples.
+
+    A zero crossing is defined as the first sample of a new half-cycle (sign
+    change between adjacent samples). Returns pos unchanged if none is found.
+    mono must be a 1-D float array.
+    """
+    lo = max(0, pos - _ZC_WINDOW)
+    hi = min(len(mono), pos + _ZC_WINDOW + 1)
+    signs = np.sign(mono[lo:hi])
+    local = np.where(np.diff(signs))[0]  # indices just before each crossing
+    if not len(local):
+        return pos
+    global_idx = local + lo + 1  # first sample on the new half-cycle
+    return int(global_idx[np.argmin(np.abs(global_idx - pos))])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sample-accurate FLAC cutting
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples):
     """
-    Remove FLAC frames that best match the region [cut_start, cut_end).
-    Validates each frame boundary with CRC-8. Updates STREAMINFO total_samples
-    and replaces SEEKTABLE with PADDING (seek points become invalid after cutting).
-    Does not re-encode audio.
+    Remove exact samples [cut_start, cut_end) from a FLAC file.
+    Both cut points are snapped to the nearest zero crossing (within ±11 ms)
+    to eliminate clicks at the splice. Re-encodes losslessly via soundfile;
+    decoded audio for kept samples is bit-for-bit identical to the original.
     """
-    with open(input_path, "rb") as f:
-        data = f.read()
+    info = sf.info(input_path)
+    sample_rate = info.samplerate
+    subtype = info.subtype
 
-    if data[:4] != b"fLaC":
-        print("Error: Not a valid FLAC file.")
-        sys.exit(1)
+    pcm, _ = sf.read(input_path, dtype="float64", always_2d=True)
+    total_samples = len(pcm)
 
-    # --- Parse metadata blocks ---
-    pos = 4
-    output_meta = []  # list of [is_last_flag, block_type, bytearray_of_data]
-    streaminfo_ref = None
-    sample_rate = 44100  # fallback; will be overwritten from STREAMINFO
+    start = max(0, min(int(round(cut_start_samples)), total_samples))
+    end   = max(0, min(int(round(cut_end_samples)),   total_samples))
 
-    while pos + 4 <= len(data):
-        is_last = (data[pos] >> 7) & 1
-        block_type = data[pos] & 0x7F
-        length = (data[pos + 1] << 16) | (data[pos + 2] << 8) | data[pos + 3]
-        block_data = bytearray(data[pos + 4: pos + 4 + length])
+    mono = pcm[:, 0]
+    snapped_start = _nearest_zero_crossing(mono, start)
+    snapped_end   = _nearest_zero_crossing(mono, end)
+    snapped_end   = max(snapped_end, snapped_start + 1)
 
-        if block_type == 0:  # STREAMINFO
-            streaminfo_ref = block_data
-            sample_rate = (block_data[10] << 12) | (block_data[11] << 4) | (block_data[12] >> 4)
-            output_meta.append([is_last, 0, block_data])
-        elif block_type == 3:  # SEEKTABLE — replace with PADDING; offsets change after cut
-            output_meta.append([is_last, 1, bytearray(length)])
-        else:
-            output_meta.append([is_last, block_type, block_data])
-
-        pos += 4 + length
-        if is_last:
-            break
-
-    if streaminfo_ref is None:
-        print("Error: No STREAMINFO block found in FLAC file.")
-        sys.exit(1)
-
-    audio_start = pos
-
-    # --- Scan for frame boundaries using sync + CRC-8 validation ---
-    frame_starts = []  # (file_offset, block_size)
-    p = audio_start
-    while p + 4 <= len(data):
-        if data[p] == 0xFF and (data[p + 1] & 0xFE) == 0xF8:
-            result = _parse_flac_frame_header(data, p)
-            if result is not None:
-                frame_starts.append((p, result["block_size"]))
-                p += 2
-                continue
-        p += 1
-
-    # Discard false-positive sync matches by validating CRC-16 of each frame.
-    # A false positive inside a real frame causes the real frame to appear truncated
-    # (bad CRC-16) followed by an extra short entry. Merge the pair back together.
-    cleaned = []
-    i = 0
-    while i < len(frame_starts):
-        fpos, bs = frame_starts[i]
-        next_pos = frame_starts[i + 1][0] if i + 1 < len(frame_starts) else len(data)
-        frame_data = data[fpos:next_pos]
-        expected_crc16 = (frame_data[-2] << 8) | frame_data[-1]
-        if _flac_crc16(frame_data[:-2]) != expected_crc16 and i + 1 < len(frame_starts):
-            # Bad CRC-16: the next entry is a false positive inside this frame.
-            # Extend to the entry after the false positive.
-            skip_pos = frame_starts[i + 2][0] if i + 2 < len(frame_starts) else len(data)
-            merged_data = data[fpos:skip_pos]
-            merged_crc16 = (merged_data[-2] << 8) | merged_data[-1]
-            if _flac_crc16(merged_data[:-2]) == merged_crc16:
-                cleaned.append((fpos, bs))
-                i += 2  # skip the false-positive entry
-                continue
-        cleaned.append((fpos, bs))
-        i += 1
-    frame_starts = cleaned
-
-    if not frame_starts:
-        print("Error: No valid FLAC frames found.")
-        sys.exit(1)
-
-    # Build frame list: (offset, byte_size, start_sample, block_size)
-    frames = []
-    current_sample = 0
-    for i, (fpos, block_size) in enumerate(frame_starts):
-        next_pos = frame_starts[i + 1][0] if i + 1 < len(frame_starts) else len(data)
-        frames.append((fpos, next_pos - fpos, current_sample, block_size))
-        current_sample += block_size
-
-    spf = frames[0][3]  # typical samples per frame (from first frame)
-
-    # Detect fixed (0) vs variable (1) blocksize — needed for correct renumbering
-    blocking_strategy = data[frames[0][0] + 1] & 0x01
-
-    # --- Determine optimal cut region (same logic as MP3) ---
     desired_length = cut_end_samples - cut_start_samples
-    num_frames_to_cut = round(desired_length / spf)
+    actual_length  = snapped_end - snapped_start
+    drift          = actual_length - desired_length
+    new_total      = total_samples - actual_length
 
-    best_start_idx = min(
-        range(len(frames)),
-        key=lambda i: abs(frames[i][2] - cut_start_samples),
-    )
+    kept = np.concatenate([pcm[:snapped_start], pcm[snapped_end:]])
+    sf.write(output_path, kept, sample_rate, subtype=subtype, format="FLAC")
 
-    if best_start_idx + num_frames_to_cut > len(frames):
-        num_frames_to_cut = len(frames) - best_start_idx
+    zc_start_shift = snapped_start - start
+    zc_end_shift   = snapped_end   - end
 
-    end_idx = best_start_idx + num_frames_to_cut
-
-    actual_start_sample = frames[best_start_idx][2]
-    actual_end_sample = frames[end_idx][2] if end_idx < len(frames) else current_sample
-    actual_length = actual_end_sample - actual_start_sample
-    drift = actual_length - desired_length
-    new_total_samples = current_sample - actual_length
-
-    # --- Update STREAMINFO total_samples (36-bit field) and zero MD5 ---
-    streaminfo_ref[13] = (streaminfo_ref[13] & 0xF0) | ((new_total_samples >> 32) & 0x0F)
-    streaminfo_ref[14] = (new_total_samples >> 24) & 0xFF
-    streaminfo_ref[15] = (new_total_samples >> 16) & 0xFF
-    streaminfo_ref[16] = (new_total_samples >> 8) & 0xFF
-    streaminfo_ref[17] = new_total_samples & 0xFF
-    for i in range(18, 34):  # zero MD5: audio content changed
-        streaminfo_ref[i] = 0
-
-    # --- Write output ---
-    with open(output_path, "wb") as f:
-        f.write(b"fLaC")
-        for k, (_, btype, bdata) in enumerate(output_meta):
-            is_last_out = 1 if k == len(output_meta) - 1 else 0
-            f.write(bytes([is_last_out << 7 | btype]))
-            f.write(bytes([(len(bdata) >> 16) & 0xFF, (len(bdata) >> 8) & 0xFF, len(bdata) & 0xFF]))
-            f.write(bdata)
-        renumber_skipped = 0
-        for i, (foff, fsize, fsample, _) in enumerate(frames):
-            if best_start_idx <= i < end_idx:
-                continue
-            frame_bytes = data[foff: foff + fsize]
-            if i >= end_idx:
-                # Fix frame/sample number so the sequence is contiguous after the cut
-                new_num = (i - num_frames_to_cut) if blocking_strategy == 0 else (fsample - actual_length)
-                patched = _patch_flac_frame_number(frame_bytes, new_num)
-                if patched is not None:
-                    frame_bytes = patched
-                else:
-                    renumber_skipped += 1
-            f.write(frame_bytes)
-    if renumber_skipped:
-        print(f"  Warning: {renumber_skipped} frames could not be renumbered (header parse failed).")
-
-    print(f"\n  Total frames  : {len(frames)}")
-    print(f"  Cut frames    : {num_frames_to_cut}")
+    print(f"\n  Total samples : {total_samples}")
+    print(f"  ZC snap (start): {zc_start_shift:+d} samples ({zc_start_shift / sample_rate * 1000:+.2f} ms)")
+    print(f"  ZC snap (end)  : {zc_end_shift:+d} samples ({zc_end_shift / sample_rate * 1000:+.2f} ms)")
     print(f"  Desired cut   : {desired_length:.0f} samples ({desired_length / sample_rate:.3f} s)")
-    print(f"  Actual cut    : {actual_length:.0f} samples ({actual_length / sample_rate:.3f} s)")
+    print(f"  Actual cut    : {actual_length} samples ({actual_length / sample_rate:.3f} s)")
     print(f"  Drift         : {drift:+.0f} samples ({drift / sample_rate * 1000:+.2f} ms)")
-    print(f"  New duration  : ~{new_total_samples / sample_rate:.2f} s")
+    print(f"  New duration  : ~{new_total / sample_rate:.2f} s")
     print(f"  Output file   : {output_path}")
 
 
@@ -715,33 +430,41 @@ def cut_flac(input_path, output_path, cut_start_samples, cut_end_samples):
 
 def cut_wav(input_path, output_path, cut_start_samples, cut_end_samples):
     """
-    Remove PCM samples in [cut_start, cut_end) from a WAV file.
-    Uses Python's stdlib wave module; no re-encoding needed since WAV is uncompressed.
+    Remove exact samples [cut_start, cut_end) from a WAV file.
+    Both cut points are snapped to the nearest zero crossing (within ±11 ms)
+    to eliminate clicks at the splice. No re-encoding needed (WAV is uncompressed).
     """
-    with wave.open(input_path, "rb") as r:
-        params = r.getparams()
-        all_frames = r.readframes(params.nframes)
+    info = sf.info(input_path)
+    sample_rate = info.samplerate
+    subtype = info.subtype
 
-    sample_rate = params.framerate
-    frame_width = params.nchannels * params.sampwidth  # bytes per sample (all channels)
+    pcm, _ = sf.read(input_path, dtype="float64", always_2d=True)
+    total_samples = len(pcm)
 
-    total_samples = params.nframes
-    start = max(0, min(int(cut_start_samples), total_samples))
-    end = max(start, min(int(cut_end_samples), total_samples))
+    start = max(0, min(int(round(cut_start_samples)), total_samples))
+    end   = max(0, min(int(round(cut_end_samples)),   total_samples))
 
-    kept = all_frames[: start * frame_width] + all_frames[end * frame_width :]
-    new_total = total_samples - (end - start)
-    actual_length = end - start
-    drift = actual_length - (cut_end_samples - cut_start_samples)
+    mono = pcm[:, 0]
+    snapped_start = _nearest_zero_crossing(mono, start)
+    snapped_end   = _nearest_zero_crossing(mono, end)
+    snapped_end   = max(snapped_end, snapped_start + 1)
 
-    with wave.open(output_path, "wb") as w:
-        w.setparams(params._replace(nframes=new_total))
-        w.writeframes(kept)
+    desired_length = cut_end_samples - cut_start_samples
+    actual_length  = snapped_end - snapped_start
+    drift          = actual_length - desired_length
+    new_total      = total_samples - actual_length
+
+    kept = np.concatenate([pcm[:snapped_start], pcm[snapped_end:]])
+    sf.write(output_path, kept, sample_rate, subtype=subtype, format="WAV")
+
+    zc_start_shift = snapped_start - start
+    zc_end_shift   = snapped_end   - end
 
     print(f"\n  Total samples : {total_samples}")
-    print(f"  Cut samples   : {actual_length}")
-    print(f"  Desired cut   : {cut_end_samples - cut_start_samples:.0f} samples ({(cut_end_samples - cut_start_samples) / sample_rate:.3f} s)")
-    print(f"  Actual cut    : {actual_length:.0f} samples ({actual_length / sample_rate:.3f} s)")
+    print(f"  ZC snap (start): {zc_start_shift:+d} samples ({zc_start_shift / sample_rate * 1000:+.2f} ms)")
+    print(f"  ZC snap (end)  : {zc_end_shift:+d} samples ({zc_end_shift / sample_rate * 1000:+.2f} ms)")
+    print(f"  Desired cut   : {desired_length:.0f} samples ({desired_length / sample_rate:.3f} s)")
+    print(f"  Actual cut    : {actual_length} samples ({actual_length / sample_rate:.3f} s)")
     print(f"  Drift         : {drift:+.0f} samples ({drift / sample_rate * 1000:+.2f} ms)")
     print(f"  New duration  : ~{new_total / sample_rate:.2f} s")
     print(f"  Output file   : {output_path}")
