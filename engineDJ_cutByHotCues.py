@@ -291,6 +291,26 @@ def resolve_track_path(db_path, relative_path):
 # Metadata updates
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _read_title(path, ext):
+    """Read the embedded track title, or return None if absent."""
+    try:
+        if ext == ".mp3":
+            audio = MP3(path, ID3=ID3)
+            if audio.tags and "TIT2" in audio.tags:
+                return str(audio.tags["TIT2"])
+        elif ext == ".flac":
+            audio = FLAC(path)
+            if audio.tags and "title" in audio:
+                return audio["title"][0]
+        elif ext == ".wav":
+            audio = WAVE(path)
+            if audio.tags and "TIT2" in audio.tags:
+                return str(audio.tags["TIT2"])
+    except Exception:
+        pass
+    return None
+
+
 def _copy_metadata(src_path, dst_path, ext):
     """Copy all embedded tags and artwork from src to dst (FLAC and WAV only)."""
     try:
@@ -731,8 +751,8 @@ def main():
             )
             sys.exit(1)
 
-    output_title = f"{name} {OUTPUT_APPENDIX}"
-    output_filename = f"{output_title}{ext}"
+    output_title = f"{_read_title(track_abs_path, ext_lower) or name} {OUTPUT_APPENDIX}"
+    output_filename = f"{name} {OUTPUT_APPENDIX}{ext}"
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     output_filepath = os.path.join(OUTPUT_PATH, output_filename)
 
