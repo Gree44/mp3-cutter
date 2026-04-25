@@ -35,12 +35,22 @@ from mutagen.wave import WAVE
 # CONFIGURATION — Edit these variables before running
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 TRACK_FILENAME = "01 - Titanium (feat. Sia) (Extended).flac"  # supports .mp3, .flac, .wav
 HOTCUE_START = 5          # Hotcue number (1–8) — cut begins here
 HOTCUE_END = 6            # Hotcue number (1–8) — cut ends here; set to None to cut to end of track
 OUTPUT_APPENDIX = "(Short Edit)"
 OUTPUT_PATH = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
 ENGINE_DB_PATH = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
+
+
+# TRACK_FILENAME = "Britney Spears - Toxic.mp3"  # supports .mp3, .flac, .wav
+# HOTCUE_START = 8          # Hotcue number (1–8) — cut begins here
+# HOTCUE_END = None            # Hotcue number (1–8) — cut ends here; set to None to cut to end of track
+# OUTPUT_APPENDIX = "(Cut End)"
+# OUTPUT_PATH = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
+# ENGINE_DB_PATH = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
+
 
 # Remap stale Engine DJ paths to their current locations when files have moved.
 PATH_REMAPS = [
