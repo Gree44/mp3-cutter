@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Audio Cutter — Cut sections from MP3, FLAC, or WAV files using Engine DJ hotcues.
-Removes audio between two hotcue positions. FLAC and WAV are cut sample-accurately
-with zero-crossing snap; MP3 is cut frame-accurately (lossless, no re-encoding).
+Audio Editor — Edit MP3, FLAC, or WAV files using Engine DJ hotcues.
+
+Three modes:
+  CUT_BETWEEN_CUES — remove audio between two hotcue positions
+  CUT_TO_END       — remove audio from a hotcue to the end of the track
+  ADD_SILENCE      — insert a block of silence at a hotcue or a timestamp
+
+FLAC and WAV are edited sample-accurately with zero-crossing snap.
+MP3 is edited frame-accurately (lossless, no re-encoding).
 """
 
 import struct
@@ -35,21 +41,41 @@ from mutagen.wave import WAVE
 # CONFIGURATION — Edit these variables before running
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Operation mode ────────────────────────────────────────────────────────────
+# Choose what the script should do, then fill in the matching section below:
+#   "CUT_BETWEEN_CUES" — delete the audio between HOTCUE_START and HOTCUE_END
+#   "CUT_TO_END"       — delete everything from HOTCUE_START to end of track
+#   "ADD_SILENCE"      — insert a block of silence at SILENCE_CUE or SILENCE_TIMESTAMP
+MODE = "CUT_BETWEEN_CUES"
 
-TRACK_FILENAME = "01 - Titanium (feat. Sia) (Extended).flac"  # supports .mp3, .flac, .wav
-HOTCUE_START = 5          # Hotcue number (1–8) — cut begins here
-HOTCUE_END = 6            # Hotcue number (1–8) — cut ends here; set to None to cut to end of track
-OUTPUT_APPENDIX = "(Short Edit)"
-OUTPUT_PATH = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
-ENGINE_DB_PATH = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
+# ── Shared settings (used by every mode) ──────────────────────────────────────
+TRACK_FILENAME  = "01 - Titanium (feat. Sia) (Extended).flac"  # .mp3, .flac, or .wav
+OUTPUT_APPENDIX = "(Short Edit)"   # appended to the output filename and embedded title
+OUTPUT_PATH     = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
+ENGINE_DB_PATH  = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
 
+# ── CUT_BETWEEN_CUES settings ─────────────────────────────────────────────────
+HOTCUE_START = 5   # hotcue number (1–8) where the cut begins
+HOTCUE_END   = 6   # hotcue number (1–8) where the cut ends
 
-# TRACK_FILENAME = "Britney Spears - Toxic.mp3"  # supports .mp3, .flac, .wav
-# HOTCUE_START = 8          # Hotcue number (1–8) — cut begins here
-# HOTCUE_END = None            # Hotcue number (1–8) — cut ends here; set to None to cut to end of track
+# ── CUT_TO_END settings ───────────────────────────────────────────────────────
+# (uses HOTCUE_START above — no additional variables needed)
+
+# ── ADD_SILENCE settings ──────────────────────────────────────────────────────
+# Set exactly one of SILENCE_CUE or SILENCE_TIMESTAMP to the insertion point;
+# leave the other as None.  The silence is spliced in at that position; audio
+# before and after plays normally.
+SILENCE_CUE           = None   # hotcue number (1–8) that marks the insertion point, or None
+SILENCE_TIMESTAMP     = None   # insertion point in seconds (float, e.g. 95.5), or None
+SILENCE_DURATION_SECS = 8.0    # length of the inserted silence in seconds
+
+# ── Example — CUT_TO_END on a different track ─────────────────────────────────
+# MODE            = "CUT_TO_END"
+# TRACK_FILENAME  = "Britney Spears - Toxic.mp3"
+# HOTCUE_START    = 8
 # OUTPUT_APPENDIX = "(Cut End)"
-# OUTPUT_PATH = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
-# ENGINE_DB_PATH = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
+# OUTPUT_PATH     = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
+# ENGINE_DB_PATH  = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
 
 
 # Remap stale Engine DJ paths to their current locations when files have moved.
@@ -694,14 +720,171 @@ def cut_wav(input_path, output_path, cut_start_samples, cut_end_samples, reverb_
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Silence insertion
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _insert_silence_pcm(input_path, output_path, insert_at_samples, silence_duration_secs, fmt):
+    """Insert silence_duration_secs of digital silence into a PCM audio file.
+
+    insert_at_samples is snapped to the nearest zero crossing so there are no
+    clicks at the splice points.  fmt must be "FLAC" or "WAV".  The original
+    bit depth (subtype) and all embedded metadata/artwork are preserved.
+    """
+    info = sf.info(input_path)
+    sample_rate = info.samplerate
+    subtype = info.subtype
+
+    pcm, _ = sf.read(input_path, dtype="float64", always_2d=True)
+    total_samples = len(pcm)
+
+    # Clamp to valid range then snap to the nearest zero crossing
+    pos = max(0, min(int(round(insert_at_samples)), total_samples))
+    snapped = _nearest_zero_crossing(pcm[:, 0], pos)
+    shift = snapped - pos  # how far the snap moved us
+
+    # Build the block of silence (all channels, float64 zeros)
+    n_ch = pcm.shape[1]
+    silence_n = int(round(silence_duration_secs * sample_rate))
+    silence = np.zeros((silence_n, n_ch), dtype=np.float64)
+
+    # Stitch: audio before insertion point | silence | audio after insertion point
+    result = np.concatenate([pcm[:snapped], silence, pcm[snapped:]])
+
+    ext = ".flac" if fmt == "FLAC" else ".wav"
+    sf.write(output_path, result, sample_rate, subtype=subtype, format=fmt)
+    _copy_metadata(input_path, output_path, ext)
+
+    print(f"\n  Total samples  : {total_samples}")
+    print(f"  Insertion pt   : sample {snapped}  ({snapped / sample_rate:.3f} s)")
+    print(f"  ZC snap        : {shift:+d} samples ({shift / sample_rate * 1000:+.2f} ms)")
+    print(f"  Silence        : {silence_n} samples ({silence_duration_secs:.3f} s)")
+    print(f"  New duration   : ~{len(result) / sample_rate:.2f} s")
+    print(f"  Output file    : {output_path}")
+
+
+def insert_silence_flac(input_path, output_path, insert_at_samples, silence_duration_secs):
+    """Insert silence into a FLAC file at insert_at_samples (sample-accurate)."""
+    _insert_silence_pcm(input_path, output_path, insert_at_samples, silence_duration_secs, "FLAC")
+
+
+def insert_silence_wav(input_path, output_path, insert_at_samples, silence_duration_secs):
+    """Insert silence into a WAV file at insert_at_samples (sample-accurate)."""
+    _insert_silence_pcm(input_path, output_path, insert_at_samples, silence_duration_secs, "WAV")
+
+
+def insert_silence_mp3(input_path, output_path, insert_at_samples, silence_duration_secs):
+    """Insert silence into an MP3 file at insert_at_samples (frame-accurate, no re-encoding).
+
+    Constructs silent MP3 frames by copying the header of the frame at the
+    insertion point and zero-filling the body.  An all-zero body means the side
+    information allocates zero Huffman bits to every subband, so decoders output
+    silence.  The ID3 tags and Xing/Info VBR header are preserved/updated.
+    """
+    with open(input_path, "rb") as f:
+        data = f.read()
+
+    id3v2_size = read_id3v2_size(data)
+    id3v2_data = data[:id3v2_size]
+
+    id3v1_data = b""
+    audio_end = len(data)
+    if len(data) >= 128 and data[-128:-125] == b"TAG":
+        id3v1_data = data[-128:]
+        audio_end -= 128
+
+    # --- Pass 1: collect every frame's byte position and sample offset ---------
+    frames = []   # list of (file_offset, frame_size, start_sample)
+    pos = id3v2_size
+    current_sample = 0
+    file_sample_rate = None
+    spf = None   # samples per frame (constant for a given Layer/version)
+
+    while pos + 4 <= audio_end:
+        info = parse_frame_header(data[pos:pos + 4])
+        if info is None:
+            pos += 1
+            continue
+        if file_sample_rate is None:
+            file_sample_rate = info["sample_rate"]
+            spf = info["samples_per_frame"]
+        frame_end = pos + info["frame_size"]
+        if frame_end > audio_end:
+            break
+        frames.append((pos, info["frame_size"], current_sample))
+        current_sample += info["samples_per_frame"]
+        pos = frame_end
+
+    if not frames:
+        print("Error: No valid MP3 frames found.")
+        sys.exit(1)
+
+    # --- Find the frame boundary closest to the target sample offset -----------
+    insert_idx = min(
+        range(len(frames)),
+        key=lambda i: abs(frames[i][2] - insert_at_samples),
+    )
+    # If the target lands past the midpoint of the last frame, append at end
+    if insert_at_samples >= frames[-1][2] + spf / 2:
+        insert_idx = len(frames)
+
+    # --- Build the block of silent frames -------------------------------------
+    # Take the header (4 bytes) of the nearest real frame and zero-fill the rest.
+    # An all-zero frame body means no bits are allocated → decoder outputs silence.
+    tmpl_idx = min(insert_idx, len(frames) - 1)
+    tmpl_pos, tmpl_size, _ = frames[tmpl_idx]
+    tmpl_header = data[tmpl_pos:tmpl_pos + 4]
+    silent_frame = tmpl_header + bytes(tmpl_size - 4)   # header + zeroed body
+
+    n_silent_frames = max(1, round(silence_duration_secs * file_sample_rate / spf))
+    silent_block = silent_frame * n_silent_frames
+
+    # --- Update VBR header totals so players report the correct duration -------
+    new_frame_count = len(frames) + n_silent_frames
+    new_byte_count = sum(f[1] for f in frames) + len(silent_block)
+
+    # --- Write output: original frames with the silent block spliced in --------
+    insert_sample = (
+        frames[insert_idx][2] if insert_idx < len(frames) else current_sample
+    )
+    with open(output_path, "wb") as f:
+        f.write(id3v2_data)
+        first_kept = True
+        for i, (foff, fsize, _) in enumerate(frames):
+            # Splice the silent block in immediately before the target frame
+            if i == insert_idx:
+                f.write(silent_block)
+            frame_bytes = data[foff:foff + fsize]
+            if first_kept:
+                # Patch the Xing/Info VBR header in the first frame
+                frame_bytes = _patch_xing_header(frame_bytes, new_frame_count, new_byte_count)
+                first_kept = False
+            f.write(frame_bytes)
+        # Handle the insert-at-end case (insert_idx == len(frames))
+        if insert_idx >= len(frames):
+            f.write(silent_block)
+        f.write(id3v1_data)
+
+    sr = file_sample_rate or 44100
+    actual_silence_secs = n_silent_frames * spf / sr
+    print(f"\n  Total frames   : {len(frames)}")
+    print(f"  Silent frames  : {n_silent_frames}")
+    print(f"  Silence        : {actual_silence_secs:.3f} s")
+    print(f"  Insertion pt   : {insert_sample / sr:.3f} s (frame {insert_idx})")
+    print(f"  New duration   : ~{(len(frames) + n_silent_frames) * spf / sr:.2f} s")
+    print(f"  Output file    : {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # ── Validate Engine DJ database ───────────────────────────────────────────
     if not os.path.isfile(ENGINE_DB_PATH):
         print(f"Error: Engine DJ database not found at:\n  {ENGINE_DB_PATH}")
         sys.exit(1)
 
+    # ── Look up the track in the Engine DJ library ────────────────────────────
     print(f"Looking up '{TRACK_FILENAME}' in Engine DJ library …")
     track_id, track_rel_path, track_fn = find_track(ENGINE_DB_PATH, TRACK_FILENAME)
     track_abs_path = resolve_track_path(ENGINE_DB_PATH, track_rel_path)
@@ -713,6 +896,7 @@ def main():
         print(f"\nError: Audio file not found at resolved path:\n  {track_abs_path}")
         sys.exit(1)
 
+    # ── List all hotcues stored in the database ───────────────────────────────
     hotcues = get_hotcues(ENGINE_DB_PATH, track_id)
     print(f"\n  Available hotcues:")
     for num in sorted(hotcues):
@@ -721,57 +905,108 @@ def main():
         remainder = secs - mins * 60
         print(f"    Cue {num}:  {mins}:{remainder:05.2f}  ({hotcues[num]:.0f} samples)")
 
+    # ── Validate audio format ─────────────────────────────────────────────────
     name, ext = os.path.splitext(track_fn)
     ext_lower = ext.lower()
     if ext_lower not in (".mp3", ".flac", ".wav"):
         print(f"Error: Unsupported file format '{ext}'. Supported: .mp3, .flac, .wav")
         sys.exit(1)
 
-    if HOTCUE_START not in hotcues:
-        print(f"\nError: Hotcue {HOTCUE_START} is not set on this track.")
-        sys.exit(1)
-
-    cut_start = hotcues[HOTCUE_START]
-
-    if HOTCUE_END is None:
-        if ext_lower in (".flac", ".wav"):
-            cut_end = sf.info(track_abs_path).frames
-        else:
-            mp3 = MP3(track_abs_path)
-            cut_end = int(mp3.info.length * mp3.info.sample_rate)
-    else:
-        if HOTCUE_END not in hotcues:
-            print(f"\nError: Hotcue {HOTCUE_END} is not set on this track.")
-            sys.exit(1)
-        cut_end = hotcues[HOTCUE_END]
-        if cut_start >= cut_end:
-            print(
-                f"\nError: Hotcue {HOTCUE_START} ({cut_start:.0f} samples) must be "
-                f"before Hotcue {HOTCUE_END} ({cut_end:.0f} samples)."
-            )
-            sys.exit(1)
-
-    output_title = f"{_read_title(track_abs_path, ext_lower) or name} {OUTPUT_APPENDIX}"
+    # ── Prepare output path ───────────────────────────────────────────────────
+    output_title    = f"{_read_title(track_abs_path, ext_lower) or name} {OUTPUT_APPENDIX}"
     output_filename = f"{name} {OUTPUT_APPENDIX}{ext}"
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     output_filepath = os.path.join(OUTPUT_PATH, output_filename)
 
-    if HOTCUE_END is None:
-        print(f"\nCutting from Cue {HOTCUE_START} to end of track …")
+    # ── Dispatch on MODE ──────────────────────────────────────────────────────
+
+    if MODE in ("CUT_BETWEEN_CUES", "CUT_TO_END"):
+        # Validate the start cue (required by both cut modes)
+        if HOTCUE_START not in hotcues:
+            print(f"\nError: Hotcue {HOTCUE_START} is not set on this track.")
+            sys.exit(1)
+
+        cut_start = hotcues[HOTCUE_START]
+
+        if MODE == "CUT_TO_END":
+            # Determine the sample offset of the very last sample in the file
+            if ext_lower in (".flac", ".wav"):
+                cut_end = sf.info(track_abs_path).frames
+            else:
+                mp3 = MP3(track_abs_path)
+                cut_end = int(mp3.info.length * mp3.info.sample_rate)
+            print(f"\nCutting from Cue {HOTCUE_START} to end of track …")
+
+        else:  # CUT_BETWEEN_CUES
+            if HOTCUE_END not in hotcues:
+                print(f"\nError: Hotcue {HOTCUE_END} is not set on this track.")
+                sys.exit(1)
+            cut_end = hotcues[HOTCUE_END]
+            if cut_start >= cut_end:
+                print(
+                    f"\nError: Hotcue {HOTCUE_START} ({cut_start:.0f} samples) must be "
+                    f"before Hotcue {HOTCUE_END} ({cut_end:.0f} samples)."
+                )
+                sys.exit(1)
+            print(f"\nCutting between Cue {HOTCUE_START} and Cue {HOTCUE_END} …")
+
+        # Reverb tail only makes sense when cutting to the end of the track
+        add_reverb = REVERB_TAIL and (MODE == "CUT_TO_END")
+
+        if ext_lower == ".mp3":
+            cut_mp3(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
+        elif ext_lower == ".flac":
+            cut_flac(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
+        else:
+            cut_wav(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
+
+    elif MODE == "ADD_SILENCE":
+        # Exactly one insertion-point source must be specified
+        if SILENCE_CUE is None and SILENCE_TIMESTAMP is None:
+            print("Error: In ADD_SILENCE mode set either SILENCE_CUE or SILENCE_TIMESTAMP.")
+            sys.exit(1)
+        if SILENCE_CUE is not None and SILENCE_TIMESTAMP is not None:
+            print("Error: Set only one of SILENCE_CUE or SILENCE_TIMESTAMP, not both.")
+            sys.exit(1)
+
+        if SILENCE_CUE is not None:
+            # Resolve the insertion point from an Engine DJ hotcue
+            if SILENCE_CUE not in hotcues:
+                print(f"\nError: Hotcue {SILENCE_CUE} is not set on this track.")
+                sys.exit(1)
+            insert_at = hotcues[SILENCE_CUE]
+            mins = int(insert_at / 44100) // 60
+            secs = (insert_at / 44100) - mins * 60
+            label = f"Cue {SILENCE_CUE} ({mins}:{secs:05.2f})"
+        else:
+            # Resolve the insertion point from a wall-clock timestamp in seconds
+            if ext_lower in (".flac", ".wav"):
+                sr = sf.info(track_abs_path).samplerate
+            else:
+                mp3 = MP3(track_abs_path)
+                sr = mp3.info.sample_rate
+            insert_at = SILENCE_TIMESTAMP * sr
+            mins = int(SILENCE_TIMESTAMP) // 60
+            secs = SILENCE_TIMESTAMP - mins * 60
+            label = f"{mins}:{secs:05.2f} ({SILENCE_TIMESTAMP:.3f} s)"
+
+        print(f"\nInserting {SILENCE_DURATION_SECS:.1f} s of silence at {label} …")
+
+        if ext_lower == ".mp3":
+            insert_silence_mp3(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
+        elif ext_lower == ".flac":
+            insert_silence_flac(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
+        else:
+            insert_silence_wav(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
+
     else:
-        print(f"\nCutting between Cue {HOTCUE_START} and Cue {HOTCUE_END} …")
+        print(f"Error: Unknown MODE '{MODE}'. Valid options: CUT_BETWEEN_CUES, CUT_TO_END, ADD_SILENCE")
+        sys.exit(1)
 
-    add_reverb = REVERB_TAIL and (HOTCUE_END is None)
-
-    if ext_lower == ".mp3":
-        cut_mp3(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
-    elif ext_lower == ".flac":
-        cut_flac(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
-    else:
-        cut_wav(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
-
+    # ── Update the embedded track title ───────────────────────────────────────
     update_track_title(output_filepath, output_title)
 
+    # ── Trigger Spotlight re-index on macOS ───────────────────────────────────
     if sys.platform == "darwin":
         subprocess.run(["mdimport", output_filepath], capture_output=True)
 
