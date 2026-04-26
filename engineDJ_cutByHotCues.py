@@ -2,10 +2,11 @@
 """
 Audio Editor — Edit MP3, FLAC, or WAV files using Engine DJ hotcues.
 
-Three modes:
+Four modes:
   CUT_BETWEEN_CUES — remove audio between two hotcue positions
   CUT_TO_END       — remove audio from a hotcue to the end of the track
   ADD_SILENCE      — insert a block of silence at a hotcue or a timestamp
+  COMPRESS         — convert FLAC/WAV to MP3, or re-encode MP3 at a lower bitrate
 
 FLAC and WAV are edited sample-accurately with zero-crossing snap.
 MP3 is edited frame-accurately (lossless, no re-encoding).
@@ -46,6 +47,7 @@ from mutagen.wave import WAVE
 #   "CUT_BETWEEN_CUES" — delete the audio between HOTCUE_START and HOTCUE_END
 #   "CUT_TO_END"       — delete everything from HOTCUE_START to end of track
 #   "ADD_SILENCE"      — insert a block of silence at SILENCE_CUE or SILENCE_TIMESTAMP
+#   "COMPRESS"         — convert FLAC/WAV to MP3, or re-encode MP3 at a lower bitrate
 MODE = "ADD_SILENCE"
 
 # ── Shared settings (used by every mode) ──────────────────────────────────────
@@ -68,6 +70,12 @@ HOTCUE_END   = 6   # hotcue number (1–8) where the cut ends
 SILENCE_CUE           = None   # hotcue number (1–8) that marks the insertion point, or None
 SILENCE_TIMESTAMP     = 0   # insertion point in seconds (float, e.g. 95.5), or None
 SILENCE_DURATION_SECS = 1    # length of the inserted silence in seconds
+
+# ── COMPRESS settings ─────────────────────────────────────────────────────────
+# Estimated MP3 size for a 4-minute track (duration × kbps ÷ 8):
+#   128 kbps → ~3.8 MB   192 kbps → ~5.6 MB   256 kbps → ~7.5 MB   320 kbps → ~9.4 MB
+COMPRESS_BITRATE         = 320   # output MP3 bitrate in kbps (e.g. 128, 192, 256, 320)
+COMPRESS_REMOVE_ARTWORK  = False  # True = strip embedded artwork (reduces file size)
 
 # ── Example — CUT_TO_END on a different track ─────────────────────────────────
 # MODE            = "CUT_TO_END"
@@ -875,6 +883,42 @@ def insert_silence_mp3(input_path, output_path, insert_at_samples, silence_durat
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# MP3 compression (ffmpeg)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compress_to_mp3(input_path, output_path, bitrate_kbps, remove_artwork=False):
+    """Convert or re-encode any supported audio file to MP3 using ffmpeg.
+
+    FLAC and WAV are transcoded losslessly-into-lossy; MP3 is re-encoded at the
+    target bitrate (smaller file, quality reduction from the original).
+    Metadata and artwork embedded in the source file are forwarded by ffmpeg,
+    unless remove_artwork=True, in which case cover art is stripped.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-codec:a", "libmp3lame",
+        "-b:a", f"{bitrate_kbps}k",
+        "-id3v2_version", "3",
+    ]
+    if remove_artwork:
+        cmd += ["-vn"]
+    cmd.append(output_path)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error: ffmpeg failed:\n{result.stderr}")
+        sys.exit(1)
+
+    src_ext = os.path.splitext(input_path)[1].upper().lstrip(".")
+    src_size = os.path.getsize(input_path)
+    dst_size = os.path.getsize(output_path)
+    print(f"\n  Source format  : {src_ext}  ({src_size / 1024 / 1024:.1f} MB)")
+    print(f"  Output bitrate : {bitrate_kbps} kbps")
+    print(f"  Output size    : {dst_size / 1024 / 1024:.1f} MB  ({dst_size * 100 // src_size}% of original)")
+    print(f"  Output file    : {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -999,8 +1043,27 @@ def main():
         else:
             insert_silence_wav(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
 
+    elif MODE == "COMPRESS":
+        # Output is always .mp3 regardless of source format
+        output_filename = f"{name} {OUTPUT_APPENDIX}.mp3"
+        output_filepath = os.path.join(OUTPUT_PATH, output_filename)
+
+        # For MP3 sources, refuse to re-encode upward (would only degrade quality)
+        if ext_lower == ".mp3":
+            src_mp3 = MP3(track_abs_path)
+            src_bitrate_kbps = src_mp3.info.bitrate // 1000
+            if src_bitrate_kbps <= COMPRESS_BITRATE:
+                print(
+                    f"\nError: Source MP3 bitrate ({src_bitrate_kbps} kbps) is already "
+                    f"≤ target bitrate ({COMPRESS_BITRATE} kbps). Nothing to compress."
+                )
+                sys.exit(1)
+
+        print(f"\nCompressing to MP3 at {COMPRESS_BITRATE} kbps …")
+        compress_to_mp3(track_abs_path, output_filepath, COMPRESS_BITRATE, COMPRESS_REMOVE_ARTWORK)
+
     else:
-        print(f"Error: Unknown MODE '{MODE}'. Valid options: CUT_BETWEEN_CUES, CUT_TO_END, ADD_SILENCE")
+        print(f"Error: Unknown MODE '{MODE}'. Valid options: CUT_BETWEEN_CUES, CUT_TO_END, ADD_SILENCE, COMPRESS")
         sys.exit(1)
 
     # ── Update the embedded track title ───────────────────────────────────────
