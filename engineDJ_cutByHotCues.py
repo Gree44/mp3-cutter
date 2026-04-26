@@ -46,11 +46,11 @@ from mutagen.wave import WAVE
 #   "CUT_BETWEEN_CUES" — delete the audio between HOTCUE_START and HOTCUE_END
 #   "CUT_TO_END"       — delete everything from HOTCUE_START to end of track
 #   "ADD_SILENCE"      — insert a block of silence at SILENCE_CUE or SILENCE_TIMESTAMP
-MODE = "CUT_BETWEEN_CUES"
+MODE = "ADD_SILENCE"
 
 # ── Shared settings (used by every mode) ──────────────────────────────────────
-TRACK_FILENAME  = "01 - Titanium (feat. Sia) (Extended).flac"  # .mp3, .flac, or .wav
-OUTPUT_APPENDIX = "(Short Edit)"   # appended to the output filename and embedded title
+TRACK_FILENAME  = "Scream & Shout.mp3"  # .mp3, .flac, or .wav
+OUTPUT_APPENDIX = "(Added Silence before Start)"   # appended to the output filename and embedded title
 OUTPUT_PATH     = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
 ENGINE_DB_PATH  = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
 
@@ -66,8 +66,8 @@ HOTCUE_END   = 6   # hotcue number (1–8) where the cut ends
 # leave the other as None.  The silence is spliced in at that position; audio
 # before and after plays normally.
 SILENCE_CUE           = None   # hotcue number (1–8) that marks the insertion point, or None
-SILENCE_TIMESTAMP     = None   # insertion point in seconds (float, e.g. 95.5), or None
-SILENCE_DURATION_SECS = 8.0    # length of the inserted silence in seconds
+SILENCE_TIMESTAMP     = 0   # insertion point in seconds (float, e.g. 95.5), or None
+SILENCE_DURATION_SECS = 1    # length of the inserted silence in seconds
 
 # ── Example — CUT_TO_END on a different track ─────────────────────────────────
 # MODE            = "CUT_TO_END"
