@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Audio Editor — Edit MP3, FLAC, or WAV files using Engine DJ hotcues.
+Audio Editor — Edit MP3, FLAC, WAV, or M4A files using Engine DJ hotcues.
 
 Four modes:
   CUT_BETWEEN_CUES — remove audio between two hotcue positions
   CUT_TO_END       — remove audio from a hotcue to the end of the track
   ADD_SILENCE      — insert a block of silence at a hotcue or a timestamp
-  COMPRESS         — convert FLAC/WAV to MP3, or re-encode MP3 at a lower bitrate
+  COMPRESS         — convert FLAC/WAV/M4A to MP3, or re-encode MP3 at a lower bitrate
 
 FLAC and WAV are edited sample-accurately with zero-crossing snap.
 MP3 is edited frame-accurately (lossless, no re-encoding).
+M4A is edited sample-accurately (decode via ffmpeg → PCM cut → re-encode to AAC).
 """
 
 import struct
@@ -36,6 +37,7 @@ except ImportError:
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TIT2, TLEN
 from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4
 from mutagen.wave import WAVE
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -51,7 +53,7 @@ from mutagen.wave import WAVE
 MODE = "CUT_BETWEEN_CUES"
 
 # ── Shared settings (used by every mode) ──────────────────────────────────────
-TRACK_FILENAME  = "ICouldBetheOne-LaLaLa(Freqture)Extended.m4a"  # .mp3, .flac, or .wav
+TRACK_FILENAME  = "ICouldBetheOne-LaLaLa(Freqture)Extended.m4a"  # .mp3, .flac, .wav, or .m4a
 OUTPUT_APPENDIX = ""   # appended to the output filename and embedded title
 OUTPUT_PATH     = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
 ENGINE_DB_PATH  = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
@@ -359,13 +361,17 @@ def _read_title(path, ext):
             audio = WAVE(path)
             if audio.tags and "TIT2" in audio.tags:
                 return str(audio.tags["TIT2"])
+        elif ext == ".m4a":
+            audio = MP4(path)
+            if audio.tags and "\xa9nam" in audio.tags:
+                return audio.tags["\xa9nam"][0]
     except Exception:
         pass
     return None
 
 
 def _copy_metadata(src_path, dst_path, ext):
-    """Copy all embedded tags and artwork from src to dst (FLAC and WAV only)."""
+    """Copy all embedded tags and artwork from src to dst (FLAC, WAV, and M4A only)."""
     try:
         if ext == ".flac":
             src = FLAC(src_path)
@@ -384,6 +390,15 @@ def _copy_metadata(src_path, dst_path, ext):
                     dst.add_tags()
                 for frame in src.tags.values():
                     dst.tags.add(frame)
+                dst.save()
+        elif ext == ".m4a":
+            src = MP4(src_path)
+            if src.tags:
+                dst = MP4(dst_path)
+                if dst.tags is None:
+                    dst.add_tags()
+                for key, value in src.tags.items():
+                    dst.tags[key] = value
                 dst.save()
     except Exception as exc:
         print(f"Warning: Could not copy metadata: {exc}")
@@ -411,6 +426,12 @@ def update_track_title(output_path, new_title):
                 audio.add_tags()
             audio.tags.setall("TIT2", [TIT2(encoding=3, text=new_title)])
             audio.save(v2_version=3)
+        elif ext == ".m4a":
+            audio = MP4(output_path)
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags["\xa9nam"] = [new_title]
+            audio.save()
         else:
             return
 
@@ -747,6 +768,126 @@ def cut_wav(input_path, output_path, cut_start_samples, cut_end_samples, reverb_
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Sample-accurate M4A cutting
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def cut_m4a(input_path, output_path, cut_start_samples, cut_end_samples, reverb_tail=False):
+    """
+    Remove samples [cut_start, cut_end) from an M4A file.
+    Uses lossless AAC frame copy — no re-encoding, no quality loss on any section.
+    Cut points snap to the nearest AAC frame boundary (~23 ms / 1024 samples at 44100 Hz).
+    When reverb_tail=True a reverb decay replaces the tail, which requires decode → re-encode.
+    """
+    cut_start_secs = cut_start_samples / 44100
+    cut_end_secs   = cut_end_samples   / 44100
+    src_duration   = MP4(input_path).info.length
+
+    if reverb_tail:
+        # Reverb tail generation requires PCM — decode → process → re-encode
+        try:
+            encode_bitrate_kbps = max(128, min(320, MP4(input_path).info.bitrate // 1000))
+        except Exception:
+            encode_bitrate_kbps = 256
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_wav     = os.path.join(tmp_dir, "decoded.wav")
+            tmp_out_wav = os.path.join(tmp_dir, "processed.wav")
+
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", input_path, tmp_wav],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                print(f"Error: ffmpeg decode failed:\n{r.stderr}")
+                sys.exit(1)
+
+            info = sf.info(tmp_wav)
+            sample_rate = info.samplerate
+            subtype     = info.subtype
+            pcm, _ = sf.read(tmp_wav, dtype="float64", always_2d=True)
+            total_samples = len(pcm)
+
+            start = max(0, min(int(round(cut_start_samples)), total_samples))
+            mono  = pcm[:, 0]
+            snapped_start = _nearest_zero_crossing(mono, start)
+
+            print("  Generating reverb tail …", flush=True)
+            pre_cut = pcm[:snapped_start]
+            pre_cut_blended, tail = _reverb_outro(pre_cut, sample_rate, blend_in=True)
+            kept = np.concatenate([pre_cut_blended, tail])
+
+            sf.write(tmp_out_wav, kept, sample_rate, subtype=subtype, format="WAV")
+            enc = subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp_out_wav,
+                 "-codec:a", "aac", "-b:a", f"{encode_bitrate_kbps}k", output_path],
+                capture_output=True, text=True,
+            )
+            if enc.returncode != 0:
+                print(f"Error: ffmpeg encode failed:\n{enc.stderr}")
+                sys.exit(1)
+
+        _copy_metadata(input_path, output_path, ".m4a")
+        print(f"\n  Reverb tail   : {len(tail) / sample_rate:.2f} s")
+        print(f"  New duration  : ~{MP4(output_path).info.length:.2f} s")
+        print(f"  Output file   : {output_path}")
+        return
+
+    # ── Lossless path: copy AAC frames, no re-encoding ────────────────────────
+    is_cut_to_end = cut_end_secs >= src_duration - 0.05
+
+    if is_cut_to_end:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", input_path,
+             "-t", f"{cut_start_secs:.6f}", "-c:a", "copy", output_path],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(f"Error: ffmpeg failed:\n{r.stderr}")
+            sys.exit(1)
+    else:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            part_a      = os.path.join(tmp_dir, "part_a.m4a")
+            part_b      = os.path.join(tmp_dir, "part_b.m4a")
+            concat_list = os.path.join(tmp_dir, "concat.txt")
+
+            for cmd in [
+                ["ffmpeg", "-y", "-i", input_path,
+                 "-t", f"{cut_start_secs:.6f}", "-c:a", "copy", part_a],
+                ["ffmpeg", "-y", "-i", input_path,
+                 "-ss", f"{cut_end_secs:.6f}", "-c:a", "copy", part_b],
+            ]:
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode != 0:
+                    print(f"Error: ffmpeg failed:\n{r.stderr}")
+                    sys.exit(1)
+
+            with open(concat_list, "w") as f:
+                f.write(f"file '{part_a}'\nfile '{part_b}'\n")
+
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", concat_list, "-c", "copy", output_path],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                print(f"Error: ffmpeg concat failed:\n{r.stderr}")
+                sys.exit(1)
+
+    _copy_metadata(input_path, output_path, ".m4a")
+
+    out_duration = MP4(output_path).info.length
+    removed      = src_duration - out_duration
+
+    print(f"\n  Note          : lossless AAC frame copy — no re-encoding")
+    print(f"  Cut start     : {cut_start_secs:.3f} s  (~23 ms frame-boundary snap)")
+    if not is_cut_to_end:
+        print(f"  Cut end       : {cut_end_secs:.3f} s  (~23 ms frame-boundary snap)")
+    print(f"  Removed       : ~{removed:.3f} s")
+    print(f"  New duration  : ~{out_duration:.2f} s")
+    print(f"  Output file   : {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Silence insertion
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -797,6 +938,73 @@ def insert_silence_flac(input_path, output_path, insert_at_samples, silence_dura
 def insert_silence_wav(input_path, output_path, insert_at_samples, silence_duration_secs):
     """Insert silence into a WAV file at insert_at_samples (sample-accurate)."""
     _insert_silence_pcm(input_path, output_path, insert_at_samples, silence_duration_secs, "WAV")
+
+
+def insert_silence_m4a(input_path, output_path, insert_at_samples, silence_duration_secs):
+    """Insert silence into an M4A file at insert_at_samples.
+
+    Original audio is frame-copied — no re-encoding, no quality loss.
+    The silence block is freshly encoded as new AAC frames at the source bitrate.
+    Insertion point snaps to the nearest AAC frame boundary (~23 ms).
+    """
+    insert_at_secs = insert_at_samples / 44100
+
+    try:
+        m4a_info            = MP4(input_path)
+        encode_bitrate_kbps = max(128, min(320, m4a_info.info.bitrate // 1000))
+        src_channels        = m4a_info.info.channels
+        src_sample_rate     = m4a_info.info.sample_rate
+    except Exception:
+        encode_bitrate_kbps = 256
+        src_channels        = 2
+        src_sample_rate     = 44100
+
+    channel_layout = "stereo" if src_channels >= 2 else "mono"
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        part_a      = os.path.join(tmp_dir, "part_a.m4a")
+        silence_m4a = os.path.join(tmp_dir, "silence.m4a")
+        part_b      = os.path.join(tmp_dir, "part_b.m4a")
+        concat_list = os.path.join(tmp_dir, "concat.txt")
+
+        for cmd, label in [
+            (["ffmpeg", "-y", "-i", input_path,
+              "-t", f"{insert_at_secs:.6f}", "-c:a", "copy", part_a],
+             "trim part A"),
+            (["ffmpeg", "-y", "-f", "lavfi", "-i",
+              f"aevalsrc=0:c={channel_layout}:s={src_sample_rate}",
+              "-t", str(silence_duration_secs),
+              "-c:a", "aac", "-b:a", f"{encode_bitrate_kbps}k", silence_m4a],
+             "generate silence"),
+            (["ffmpeg", "-y", "-i", input_path,
+              "-ss", f"{insert_at_secs:.6f}", "-c:a", "copy", part_b],
+             "trim part B"),
+        ]:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"Error: ffmpeg {label} failed:\n{r.stderr}")
+                sys.exit(1)
+
+        with open(concat_list, "w") as f:
+            f.write(f"file '{part_a}'\nfile '{silence_m4a}'\nfile '{part_b}'\n")
+
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+             "-i", concat_list, "-c", "copy", output_path],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(f"Error: ffmpeg concat failed:\n{r.stderr}")
+            sys.exit(1)
+
+    _copy_metadata(input_path, output_path, ".m4a")
+
+    out_duration = MP4(output_path).info.length
+    print(f"\n  Note          : lossless AAC frame copy for original audio")
+    print(f"  Insertion pt  : {insert_at_secs:.3f} s  (~23 ms frame-boundary snap)")
+    print(f"  Silence       : {silence_duration_secs:.3f} s")
+    print(f"  New duration  : ~{out_duration:.2f} s")
+    print(f"  Output file   : {output_path}")
 
 
 def insert_silence_mp3(input_path, output_path, insert_at_samples, silence_duration_secs):
@@ -971,8 +1179,8 @@ def main():
     # ── Validate audio format ─────────────────────────────────────────────────
     name, ext = os.path.splitext(track_fn)
     ext_lower = ext.lower()
-    if ext_lower not in (".mp3", ".flac", ".wav"):
-        print(f"Error: Unsupported file format '{ext}'. Supported: .mp3, .flac, .wav")
+    if ext_lower not in (".mp3", ".flac", ".wav", ".m4a"):
+        print(f"Error: Unsupported file format '{ext}'. Supported: .mp3, .flac, .wav, .m4a")
         sys.exit(1)
 
     # ── Prepare output path ───────────────────────────────────────────────────
@@ -995,6 +1203,9 @@ def main():
             # Determine the sample offset of the very last sample in the file
             if ext_lower in (".flac", ".wav"):
                 cut_end = sf.info(track_abs_path).frames
+            elif ext_lower == ".m4a":
+                m4a_info = MP4(track_abs_path)
+                cut_end = int(m4a_info.info.length * m4a_info.info.sample_rate)
             else:
                 mp3 = MP3(track_abs_path)
                 cut_end = int(mp3.info.length * mp3.info.sample_rate)
@@ -1020,6 +1231,8 @@ def main():
             cut_mp3(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
         elif ext_lower == ".flac":
             cut_flac(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
+        elif ext_lower == ".m4a":
+            cut_m4a(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
         else:
             cut_wav(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
 
@@ -1045,6 +1258,8 @@ def main():
             # Resolve the insertion point from a wall-clock timestamp in seconds
             if ext_lower in (".flac", ".wav"):
                 sr = sf.info(track_abs_path).samplerate
+            elif ext_lower == ".m4a":
+                sr = MP4(track_abs_path).info.sample_rate
             else:
                 mp3 = MP3(track_abs_path)
                 sr = mp3.info.sample_rate
@@ -1059,6 +1274,8 @@ def main():
             insert_silence_mp3(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
         elif ext_lower == ".flac":
             insert_silence_flac(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
+        elif ext_lower == ".m4a":
+            insert_silence_m4a(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
         else:
             insert_silence_wav(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
 
