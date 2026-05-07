@@ -37,7 +37,7 @@ except ImportError:
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TIT2, TLEN
 from mutagen.mp3 import MP3
-from mutagen.mp4 import MP4
+from mutagen.mp4 import MP4, MP4Cover
 from mutagen.wave import WAVE
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -399,6 +399,16 @@ def _copy_metadata(src_path, dst_path, ext):
                     dst.add_tags()
                 for key, value in src.tags.items():
                     dst.tags[key] = value
+                # Fallback: some encoders store artwork only as an attached video stream
+                # rather than in the ilst/covr metadata atom that mutagen reads.
+                if "covr" not in src.tags:
+                    r = subprocess.run(
+                        ["ffmpeg", "-y", "-i", src_path,
+                         "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
+                        capture_output=True,
+                    )
+                    if r.returncode == 0 and r.stdout:
+                        dst.tags["covr"] = [MP4Cover(r.stdout, MP4Cover.FORMAT_PNG)]
                 dst.save()
     except Exception as exc:
         print(f"Warning: Could not copy metadata: {exc}")
@@ -838,7 +848,7 @@ def cut_m4a(input_path, output_path, cut_start_samples, cut_end_samples, reverb_
     if is_cut_to_end:
         r = subprocess.run(
             ["ffmpeg", "-y", "-i", input_path,
-             "-t", f"{cut_start_secs:.6f}", "-c:a", "copy", output_path],
+             "-t", f"{cut_start_secs:.6f}", "-vn", "-c:a", "copy", output_path],
             capture_output=True, text=True,
         )
         if r.returncode != 0:
@@ -852,9 +862,9 @@ def cut_m4a(input_path, output_path, cut_start_samples, cut_end_samples, reverb_
 
             for cmd in [
                 ["ffmpeg", "-y", "-i", input_path,
-                 "-t", f"{cut_start_secs:.6f}", "-c:a", "copy", part_a],
+                 "-t", f"{cut_start_secs:.6f}", "-vn", "-c:a", "copy", part_a],
                 ["ffmpeg", "-y", "-i", input_path,
-                 "-ss", f"{cut_end_secs:.6f}", "-c:a", "copy", part_b],
+                 "-ss", f"{cut_end_secs:.6f}", "-vn", "-c:a", "copy", part_b],
             ]:
                 r = subprocess.run(cmd, capture_output=True, text=True)
                 if r.returncode != 0:
@@ -866,7 +876,7 @@ def cut_m4a(input_path, output_path, cut_start_samples, cut_end_samples, reverb_
 
             r = subprocess.run(
                 ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                 "-i", concat_list, "-c", "copy", output_path],
+                 "-i", concat_list, "-c:a", "copy", output_path],
                 capture_output=True, text=True,
             )
             if r.returncode != 0:
@@ -969,7 +979,7 @@ def insert_silence_m4a(input_path, output_path, insert_at_samples, silence_durat
 
         for cmd, label in [
             (["ffmpeg", "-y", "-i", input_path,
-              "-t", f"{insert_at_secs:.6f}", "-c:a", "copy", part_a],
+              "-t", f"{insert_at_secs:.6f}", "-vn", "-c:a", "copy", part_a],
              "trim part A"),
             (["ffmpeg", "-y", "-f", "lavfi", "-i",
               f"aevalsrc=0:c={channel_layout}:s={src_sample_rate}",
@@ -977,7 +987,7 @@ def insert_silence_m4a(input_path, output_path, insert_at_samples, silence_durat
               "-c:a", "aac", "-b:a", f"{encode_bitrate_kbps}k", silence_m4a],
              "generate silence"),
             (["ffmpeg", "-y", "-i", input_path,
-              "-ss", f"{insert_at_secs:.6f}", "-c:a", "copy", part_b],
+              "-ss", f"{insert_at_secs:.6f}", "-vn", "-c:a", "copy", part_b],
              "trim part B"),
         ]:
             r = subprocess.run(cmd, capture_output=True, text=True)
