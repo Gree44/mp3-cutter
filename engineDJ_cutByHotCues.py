@@ -46,17 +46,17 @@ from mutagen.wave import WAVE
 #   "CUT_BETWEEN_CUES" — delete the audio between HOTCUE_START and HOTCUE_END
 #   "CUT_TO_END"       — delete everything from HOTCUE_START to end of track
 #   "ADD_SILENCE"      — insert a block of silence at SILENCE_CUE or SILENCE_TIMESTAMP
-MODE = "ADD_SILENCE"
+MODE = "CUT_BETWEEN_CUES"
 
 # ── Shared settings (used by every mode) ──────────────────────────────────────
-TRACK_FILENAME  = "Scream & Shout.mp3"  # .mp3, .flac, or .wav
-OUTPUT_APPENDIX = "(Added Silence before Start)"   # appended to the output filename and embedded title
+TRACK_FILENAME  = "ICouldBetheOne-LaLaLa(Freqture)Extended.m4a"  # .mp3, .flac, or .wav
+OUTPUT_APPENDIX = ""   # appended to the output filename and embedded title
 OUTPUT_PATH     = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
 ENGINE_DB_PATH  = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
 
 # ── CUT_BETWEEN_CUES settings ─────────────────────────────────────────────────
-HOTCUE_START = 5   # hotcue number (1–8) where the cut begins
-HOTCUE_END   = 6   # hotcue number (1–8) where the cut ends
+HOTCUE_START = 6   # hotcue number (1–8) where the cut begins
+HOTCUE_END   = 7   # hotcue number (1–8) where the cut ends
 
 # ── CUT_TO_END settings ───────────────────────────────────────────────────────
 # (uses HOTCUE_START above — no additional variables needed)
@@ -84,13 +84,13 @@ PATH_REMAPS = [
 ]
 
 # Reverb tail — only applied when cutting to end of track (HOTCUE_END = None).
-REVERB_TAIL       = False   # set True to append reverb decay after the cut point
-REVERB_ROOM_SIZE  = 0.75    # 0.0–1.0
-REVERB_DAMPING    = 0.5     # 0.0–1.0
-REVERB_WET_LEVEL  = 0.25    # 0.0–1.0  (tail amplitude)
+REVERB_TAIL       = True   # set True to append reverb decay after the cut point
+REVERB_ROOM_SIZE  = 1    # 0.0–1.0
+REVERB_DAMPING    = 0.5     # 0.0–1.0 
+REVERB_WET_LEVEL  = 0.2    # 0.0–1.0  (tail amplitude)
 REVERB_WIDTH      = 1.0     # stereo width 0.0–1.0
 REVERB_TAIL_SECS  = 4.0     # seconds of decay to append
-REVERB_BLEND_SECS = 2.0     # seconds before cut over which reverb fades in
+REVERB_BLEND_SECS = 0.1     # seconds before cut over which reverb fades in
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MP3 constants
@@ -291,24 +291,43 @@ def get_hotcues(db_path, track_id):
 
 def resolve_track_path(db_path, relative_path):
     """Resolve a track path from the DB to an existing absolute path if possible."""
-    db_dir = os.path.dirname(os.path.abspath(db_path))
-    resolved = os.path.normpath(os.path.expanduser(os.path.join(db_dir, relative_path)))
+    # If the path from the DB is already absolute, use it directly.
+    if os.path.isabs(relative_path):
+        resolved = os.path.normpath(os.path.expanduser(relative_path))
+    else:
+        # Otherwise, join it with the DB directory.
+        db_dir = os.path.dirname(os.path.abspath(db_path))
+        resolved = os.path.normpath(os.path.expanduser(os.path.join(db_dir, relative_path)))
 
     if os.path.isfile(resolved):
         return resolved
 
+    # The path from DB might be stale, try remapping.
+    # This handles cases where the user's music folder has moved.
     for legacy_root, current_root in PATH_REMAPS:
         legacy_abs = os.path.normpath(os.path.expanduser(legacy_root))
         current_abs = os.path.normpath(os.path.expanduser(current_root))
+        
+        # Determine the path to check for remapping. Use the original relative path
+        # if it seems like a full path structure, otherwise use the resolved one.
+        path_to_check = relative_path if relative_path.startswith('/Users') or relative_path.startswith('C:') else resolved
+
         try:
-            if os.path.commonpath([resolved, legacy_abs]) == legacy_abs:
-                rel = os.path.relpath(resolved, legacy_abs)
+            # Check if the path is within a known legacy location.
+            if os.path.commonpath([path_to_check, legacy_abs]) == legacy_abs:
+                # Rebase the path from the legacy root to the current root.
+                rel = os.path.relpath(path_to_check, legacy_abs)
                 remapped = os.path.normpath(os.path.join(current_abs, rel))
                 if os.path.isfile(remapped):
                     return remapped
         except ValueError:
-            # Paths on different mounts/drives cannot share a common root.
+            # This can happen if paths are on different drives on Windows.
             continue
+    
+    # Also handle the case where the raw relative_path just needs user expansion
+    expanded_rel = os.path.expanduser(relative_path)
+    if os.path.isfile(expanded_rel):
+        return expanded_rel
 
     return resolved
 
