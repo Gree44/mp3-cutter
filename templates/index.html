@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MP3 Cutter</title>
+<style>
+  :root {
+    --bg:      #0f1117;
+    --surface: #1a1d27;
+    --card:    #20253a;
+    --border:  #2e3350;
+    --accent:  #5b7fff;
+    --accent2: #7c5bff;
+    --green:   #3ecf8e;
+    --red:     #f04e60;
+    --text:    #e2e6f3;
+    --muted:   #7a82a8;
+    --radius:  10px;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 24px 16px 60px;
+  }
+  h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: .02em; color: var(--text); }
+  h2 { font-size: .85rem; font-weight: 600; text-transform: uppercase;
+       letter-spacing: .08em; color: var(--muted); margin-bottom: 14px; }
+  .wrap { max-width: 740px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
+  .header { display: flex; align-items: center; gap: 12px; padding-bottom: 4px; }
+  .logo { width: 36px; height: 36px; border-radius: 8px;
+          background: linear-gradient(135deg, var(--accent), var(--accent2));
+          display: flex; align-items: center; justify-content: center;
+          font-size: 1.2rem; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 22px;
+  }
+  .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+  .field:last-child { margin-bottom: 0; }
+  label { font-size: .8rem; font-weight: 600; color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
+  input[type=text], input[type=number], select {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    color: var(--text);
+    font-size: .95rem;
+    padding: 9px 12px;
+    width: 100%;
+    outline: none;
+    transition: border-color .15s;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  select option { background: var(--card); }
+
+  /* track search */
+  .track-search-wrap { position: relative; }
+  #track-search {
+    background: var(--card); border: 1px solid var(--border); border-radius: 7px;
+    color: var(--text); font-size: .95rem; padding: 9px 12px; width: 100%; outline: none;
+    transition: border-color .15s;
+  }
+  #track-search:focus { border-color: var(--accent); }
+  #track-dropdown {
+    display: none; position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 100;
+    background: var(--card); border: 1px solid var(--border); border-radius: 7px;
+    max-height: 240px; overflow-y: auto;
+  }
+  .track-opt {
+    padding: 9px 13px; cursor: pointer; font-size: .9rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .track-opt:last-child { border-bottom: none; }
+  .track-opt:hover, .track-opt.active { background: var(--border); }
+  .track-opt .sub { font-size: .75rem; color: var(--muted); margin-top: 2px; }
+
+  /* mode tabs */
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tab {
+    padding: 7px 16px; border-radius: 7px; font-size: .85rem; font-weight: 600;
+    border: 1px solid var(--border); background: var(--card); color: var(--muted);
+    cursor: pointer; transition: all .15s;
+  }
+  .tab.active {
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    border-color: transparent; color: #fff;
+  }
+
+  /* cue buttons */
+  .cue-grid { display: flex; gap: 7px; flex-wrap: wrap; }
+  .cue-btn {
+    width: 44px; height: 44px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--card); color: var(--muted); font-size: .95rem; font-weight: 700;
+    cursor: pointer; transition: all .15s; display: flex; align-items: center; justify-content: center;
+    position: relative;
+  }
+  .cue-btn:hover { border-color: var(--accent); color: var(--text); }
+  .cue-btn.selected {
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    border-color: transparent; color: #fff;
+  }
+  .cue-btn.has-cue::after {
+    content: ''; position: absolute; bottom: 4px; left: 50%; transform: translateX(-50%);
+    width: 4px; height: 4px; border-radius: 50%; background: var(--green);
+  }
+  .cue-btn.selected.has-cue::after { background: rgba(255,255,255,.6); }
+  .cue-time { font-size: .75rem; color: var(--muted); margin-top: 6px; min-height: 16px; }
+
+  /* toggle */
+  .toggle-row { display: flex; align-items: center; gap: 10px; }
+  .toggle {
+    width: 42px; height: 24px; border-radius: 12px; background: var(--border);
+    border: none; cursor: pointer; position: relative; transition: background .2s; flex-shrink: 0;
+  }
+  .toggle.on { background: var(--accent); }
+  .toggle::after {
+    content: ''; position: absolute; top: 3px; left: 3px;
+    width: 18px; height: 18px; border-radius: 50%; background: #fff;
+    transition: transform .2s;
+  }
+  .toggle.on::after { transform: translateX(18px); }
+  .toggle-label { font-size: .9rem; }
+
+  /* mode panels */
+  .mode-panel { display: none; }
+  .mode-panel.visible { display: block; }
+
+  /* reverb collapsible */
+  .collapsible-header {
+    display: flex; align-items: center; gap: 8px; cursor: pointer;
+    user-select: none; padding: 8px 0; color: var(--muted); font-size: .82rem;
+    font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+  }
+  .collapsible-header .chevron { transition: transform .2s; display: inline-block; }
+  .collapsible-header.open .chevron { transform: rotate(90deg); }
+  .collapsible-body { display: none; padding-top: 10px; }
+  .collapsible-body.open { display: block; }
+
+  /* slider row */
+  .slider-row { display: flex; align-items: center; gap: 10px; }
+  .slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .slider-val { width: 42px; text-align: right; font-size: .85rem; color: var(--text); }
+
+  /* run button */
+  #run-btn {
+    width: 100%; padding: 14px; border-radius: var(--radius); font-size: 1rem; font-weight: 700;
+    border: none; cursor: pointer; letter-spacing: .03em;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #fff; transition: opacity .15s;
+  }
+  #run-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+  /* log */
+  #log-card { display: none; }
+  #log {
+    background: #0a0c14; border-radius: 7px; padding: 14px 16px;
+    font-family: "SF Mono", "Fira Code", monospace; font-size: .82rem; line-height: 1.6;
+    color: #b8c2e0; max-height: 320px; overflow-y: auto; white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .log-success { color: var(--green); }
+  .log-error   { color: var(--red); }
+
+  /* two-col grid for small fields */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media(max-width: 480px) { .grid2 { grid-template-columns: 1fr; } }
+
+  .hint { font-size: .75rem; color: var(--muted); margin-top: 3px; }
+  .sep { border: none; border-top: 1px solid var(--border); margin: 4px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="header">
+    <div class="logo">✂️</div>
+    <h1>MP3 Cutter</h1>
+  </div>
+
+  <!-- ── Track ─────────────────────────────────────────── -->
+  <div class="card">
+    <h2>Track</h2>
+    <div class="field">
+      <label>Search playlist or enter filename</label>
+      <div class="track-search-wrap">
+        <input id="track-search" type="text" placeholder="Type to search or enter filename…" autocomplete="off">
+        <div id="track-dropdown"></div>
+      </div>
+      <div class="hint" id="track-hint"></div>
+    </div>
+  </div>
+
+  <!-- ── Settings ──────────────────────────────────────── -->
+  <div class="card">
+    <h2>Settings</h2>
+    <div class="grid2">
+      <div class="field">
+        <label>Output folder</label>
+        <input id="output_path" type="text">
+      </div>
+      <div class="field">
+        <label>Output filename suffix</label>
+        <input id="output_appendix" type="text" placeholder="e.g. (Edit)">
+      </div>
+    </div>
+    <div class="field">
+      <label>Engine DJ database path</label>
+      <input id="engine_db_path" type="text">
+    </div>
+  </div>
+
+  <!-- ── Mode ──────────────────────────────────────────── -->
+  <div class="card">
+    <h2>Mode</h2>
+    <div class="tabs" id="mode-tabs">
+      <button class="tab" data-mode="CUT_BETWEEN_CUES">Cut between cues</button>
+      <button class="tab" data-mode="CUT_TO_END">Cut to end</button>
+      <button class="tab" data-mode="ADD_SILENCE">Add silence</button>
+      <button class="tab" data-mode="COMPRESS">Compress</button>
+    </div>
+  </div>
+
+  <!-- ── CUT_BETWEEN_CUES ──────────────────────────────── -->
+  <div class="card mode-panel" id="panel-CUT_BETWEEN_CUES">
+    <h2>Cut between cues</h2>
+    <div class="grid2">
+      <div class="field">
+        <label>Start cue</label>
+        <div class="cue-grid" id="cbc-start-btns"></div>
+        <div class="cue-time" id="cbc-start-time"></div>
+      </div>
+      <div class="field">
+        <label>End cue</label>
+        <div class="cue-grid" id="cbc-end-btns"></div>
+        <div class="cue-time" id="cbc-end-time"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CUT_TO_END ────────────────────────────────────── -->
+  <div class="card mode-panel" id="panel-CUT_TO_END">
+    <h2>Cut to end</h2>
+    <div class="field">
+      <label>Cut from cue</label>
+      <div class="cue-grid" id="cte-btns"></div>
+      <div class="cue-time" id="cte-time"></div>
+    </div>
+    <hr class="sep">
+    <div class="collapsible-header" id="reverb-toggle">
+      <span class="chevron">▶</span> Reverb tail
+      <span id="reverb-enabled-badge" style="margin-left:auto;font-size:.75rem;"></span>
+    </div>
+    <div class="collapsible-body" id="reverb-body">
+      <div class="field" style="margin-top:4px;">
+        <div class="toggle-row">
+          <button class="toggle" id="reverb-toggle-btn"></button>
+          <span class="toggle-label">Enable reverb tail</span>
+        </div>
+      </div>
+      <div id="reverb-params">
+        <div class="field">
+          <label>Room size</label>
+          <div class="slider-row">
+            <input type="range" id="reverb_room_size" min="0" max="1" step="0.01">
+            <span class="slider-val" id="reverb_room_size_val"></span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Damping</label>
+          <div class="slider-row">
+            <input type="range" id="reverb_damping" min="0" max="1" step="0.01">
+            <span class="slider-val" id="reverb_damping_val"></span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Wet level</label>
+          <div class="slider-row">
+            <input type="range" id="reverb_wet_level" min="0" max="1" step="0.01">
+            <span class="slider-val" id="reverb_wet_level_val"></span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Width</label>
+          <div class="slider-row">
+            <input type="range" id="reverb_width" min="0" max="1" step="0.01">
+            <span class="slider-val" id="reverb_width_val"></span>
+          </div>
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label>Tail length (s)</label>
+            <input type="number" id="reverb_tail_secs" min="0.5" max="30" step="0.5">
+          </div>
+          <div class="field">
+            <label>Blend (s)</label>
+            <input type="number" id="reverb_blend_secs" min="0" max="2" step="0.05">
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── ADD_SILENCE ───────────────────────────────────── -->
+  <div class="card mode-panel" id="panel-ADD_SILENCE">
+    <h2>Add silence</h2>
+    <div class="field">
+      <div class="toggle-row">
+        <button class="toggle" id="silence-cue-toggle"></button>
+        <span class="toggle-label" id="silence-source-label"></span>
+      </div>
+    </div>
+    <div id="silence-cue-picker" class="field">
+      <label>Insert at cue</label>
+      <div class="cue-grid" id="as-btns"></div>
+      <div class="cue-time" id="as-time"></div>
+    </div>
+    <div id="silence-ts-picker" class="field" style="display:none;">
+      <label>Insert at timestamp (seconds)</label>
+      <input type="number" id="add_silence_timestamp" min="0" step="0.1">
+    </div>
+    <div class="field" style="margin-top:4px;">
+      <label>Silence duration (seconds)</label>
+      <input type="number" id="add_silence_duration_secs" min="0.1" step="0.1">
+    </div>
+  </div>
+
+  <!-- ── COMPRESS ──────────────────────────────────────── -->
+  <div class="card mode-panel" id="panel-COMPRESS">
+    <h2>Compress to MP3</h2>
+    <div class="field">
+      <label>Output bitrate (kbps)</label>
+      <div class="tabs" id="bitrate-tabs">
+        <button class="tab" data-bitrate="128">128</button>
+        <button class="tab" data-bitrate="192">192</button>
+        <button class="tab" data-bitrate="256">256</button>
+        <button class="tab" data-bitrate="320">320</button>
+      </div>
+    </div>
+    <div class="field" style="margin-top:8px;">
+      <div class="toggle-row">
+        <button class="toggle" id="artwork-toggle"></button>
+        <span class="toggle-label">Strip embedded artwork</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Run ───────────────────────────────────────────── -->
+  <button id="run-btn">Run</button>
+
+  <!-- ── Log ───────────────────────────────────────────── -->
+  <div class="card" id="log-card">
+    <h2>Output</h2>
+    <div id="log"></div>
+  </div>
+
+</div>
+
+<script>
+// ── state ──────────────────────────────────────────────────────────────────
+let csvTracks = [];
+let hotcues   = {};   // {cue_num: seconds}
+let state     = {};
+let currentMode = "CUT_BETWEEN_CUES";
+
+// ── boot ───────────────────────────────────────────────────────────────────
+async function boot() {
+  const [s, tracks] = await Promise.all([
+    fetch("/api/state").then(r => r.json()),
+    fetch("/api/csv_tracks").then(r => r.json()),
+  ]);
+  state     = s;
+  csvTracks = tracks;
+
+  applyState();
+  setMode(state.mode || "CUT_BETWEEN_CUES");
+
+  if (state.track_filename) {
+    await loadHotcues(state.track_filename);
+  }
+}
+
+// ── apply saved state to all inputs ───────────────────────────────────────
+function applyState() {
+  document.getElementById("track-search").value  = state.track_filename || "";
+  document.getElementById("output_path").value   = state.output_path || "";
+  document.getElementById("output_appendix").value = state.output_appendix || "";
+  document.getElementById("engine_db_path").value = state.engine_db_path || "";
+
+  setToggle("reverb-toggle-btn",  state.cut_to_end_reverb_tail !== false);
+  setToggle("silence-cue-toggle", state.add_silence_use_cue !== false);
+  setToggle("artwork-toggle",     state.compress_remove_artwork === true);
+
+  setSlider("reverb_room_size",  state.cut_to_end_reverb_room_size ?? 1.0);
+  setSlider("reverb_damping",    state.cut_to_end_reverb_damping   ?? 0.5);
+  setSlider("reverb_wet_level",  state.cut_to_end_reverb_wet_level ?? 0.2);
+  setSlider("reverb_width",      state.cut_to_end_reverb_width     ?? 1.0);
+
+  document.getElementById("reverb_tail_secs").value  = state.cut_to_end_reverb_tail_secs  ?? 4.0;
+  document.getElementById("reverb_blend_secs").value = state.cut_to_end_reverb_blend_secs ?? 0.1;
+
+  document.getElementById("add_silence_timestamp").value    = state.add_silence_timestamp    ?? 0;
+  document.getElementById("add_silence_duration_secs").value = state.add_silence_duration_secs ?? 1.0;
+
+  updateSilenceSourceUI();
+  setBitrateTab(state.compress_bitrate || 320);
+  updateReverbParamsVisibility();
+}
+
+// ── mode ───────────────────────────────────────────────────────────────────
+const MODE_DEFAULTS = {
+  CUT_BETWEEN_CUES: "(Short Edit)",
+  CUT_TO_END:       "(Short Edit)",
+  ADD_SILENCE:      "(Added Silence)",
+  COMPRESS:         "LQ",
+};
+
+function setMode(mode) {
+  currentMode = mode;
+  document.querySelectorAll(".tab[data-mode]").forEach(t =>
+    t.classList.toggle("active", t.dataset.mode === mode)
+  );
+  document.querySelectorAll(".mode-panel").forEach(p =>
+    p.classList.toggle("visible", p.id === `panel-${mode}`)
+  );
+
+  // Auto-fill suffix only when the current value is blank or another known default
+  const suffixEl = document.getElementById("output_appendix");
+  const known    = new Set(Object.values(MODE_DEFAULTS));
+  if (!suffixEl.value.trim() || known.has(suffixEl.value.trim())) {
+    suffixEl.value = MODE_DEFAULTS[mode] ?? "";
+  }
+
+  rebuildCueBtns();
+}
+
+document.getElementById("mode-tabs").addEventListener("click", e => {
+  const btn = e.target.closest("[data-mode]");
+  if (btn) setMode(btn.dataset.mode);
+});
+
+// ── bitrate tabs ───────────────────────────────────────────────────────────
+function setBitrateTab(val) {
+  document.querySelectorAll(".tab[data-bitrate]").forEach(t =>
+    t.classList.toggle("active", parseInt(t.dataset.bitrate) === parseInt(val))
+  );
+}
+document.getElementById("bitrate-tabs").addEventListener("click", e => {
+  const btn = e.target.closest("[data-bitrate]");
+  if (btn) setBitrateTab(btn.dataset.bitrate);
+});
+
+// ── toggle helper ──────────────────────────────────────────────────────────
+function setToggle(id, on) {
+  document.getElementById(id).classList.toggle("on", !!on);
+}
+function getToggle(id) {
+  return document.getElementById(id).classList.contains("on");
+}
+document.querySelectorAll(".toggle").forEach(btn => {
+  btn.addEventListener("click", () => {
+    btn.classList.toggle("on");
+    if (btn.id === "reverb-toggle-btn")  updateReverbParamsVisibility();
+    if (btn.id === "silence-cue-toggle") updateSilenceSourceUI();
+  });
+});
+
+function updateReverbParamsVisibility() {
+  const on = getToggle("reverb-toggle-btn");
+  document.getElementById("reverb-params").style.opacity  = on ? "1"    : "0.35";
+  document.getElementById("reverb-params").style.pointerEvents = on ? "auto" : "none";
+  document.getElementById("reverb-enabled-badge").textContent  = on ? "ON" : "OFF";
+  document.getElementById("reverb-enabled-badge").style.color  = on ? "var(--green)" : "var(--muted)";
+}
+
+function updateSilenceSourceUI() {
+  const useCue = getToggle("silence-cue-toggle");
+  document.getElementById("silence-source-label").textContent = useCue ? "Use hotcue" : "Use timestamp";
+  document.getElementById("silence-cue-picker").style.display  = useCue ? "block" : "none";
+  document.getElementById("silence-ts-picker").style.display   = useCue ? "none"  : "block";
+}
+
+// ── reverb collapsible ─────────────────────────────────────────────────────
+document.getElementById("reverb-toggle").addEventListener("click", function() {
+  this.classList.toggle("open");
+  document.getElementById("reverb-body").classList.toggle("open");
+});
+
+// ── slider helper ──────────────────────────────────────────────────────────
+function setSlider(id, val) {
+  const el  = document.getElementById(id);
+  const out = document.getElementById(id + "_val");
+  el.value  = val;
+  if (out) out.textContent = parseFloat(val).toFixed(2);
+}
+document.querySelectorAll("input[type=range]").forEach(el => {
+  el.addEventListener("input", () => {
+    const out = document.getElementById(el.id + "_val");
+    if (out) out.textContent = parseFloat(el.value).toFixed(2);
+  });
+});
+
+// ── track search / dropdown ────────────────────────────────────────────────
+const searchEl = document.getElementById("track-search");
+const dropEl   = document.getElementById("track-dropdown");
+
+searchEl.addEventListener("input", () => {
+  const q = searchEl.value.toLowerCase().trim();
+  if (!q) { dropEl.style.display = "none"; return; }
+  const matches = csvTracks.filter(t =>
+    t.label.toLowerCase().includes(q) || t.filename.toLowerCase().includes(q)
+  ).slice(0, 40);
+  if (!matches.length) { dropEl.style.display = "none"; return; }
+  dropEl.innerHTML = matches.map((t, i) =>
+    `<div class="track-opt" data-i="${i}" data-fn="${esc(t.filename)}">
+       ${esc(t.label)}
+       <div class="sub">${esc(t.filename)}</div>
+     </div>`
+  ).join("");
+  dropEl.style.display = "block";
+  // store filtered list for click
+  dropEl._matches = matches;
+});
+
+dropEl.addEventListener("click", async e => {
+  const opt = e.target.closest(".track-opt");
+  if (!opt) return;
+  const fn = opt.dataset.fn;
+  searchEl.value       = fn;
+  dropEl.style.display = "none";
+  document.getElementById("track-hint").textContent = opt.querySelector(".sub")?.textContent || "";
+  await loadHotcues(fn);
+});
+
+searchEl.addEventListener("blur", () => {
+  setTimeout(() => { dropEl.style.display = "none"; }, 150);
+});
+searchEl.addEventListener("keydown", e => {
+  if (e.key === "Escape") dropEl.style.display = "none";
+  if (e.key === "Enter") {
+    dropEl.style.display = "none";
+    loadHotcues(searchEl.value.trim());
+  }
+});
+
+function esc(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+// ── hotcue loading ─────────────────────────────────────────────────────────
+async function loadHotcues(filename) {
+  if (!filename) { hotcues = {}; rebuildCueBtns(); return; }
+  const dbPath = document.getElementById("engine_db_path").value.trim();
+  const url    = `/api/hotcues?filename=${encodeURIComponent(filename)}&db_path=${encodeURIComponent(dbPath)}`;
+  try {
+    const data = await fetch(url).then(r => r.json());
+    if (data.error) {
+      hotcues = {};
+      document.getElementById("track-hint").textContent = "⚠ " + data.error;
+    } else {
+      hotcues = data;
+      const count = Object.keys(hotcues).length;
+      document.getElementById("track-hint").textContent =
+        count ? `${count} hotcue${count>1?"s":""} found in Engine DJ` : "No hotcues found";
+    }
+  } catch(e) {
+    hotcues = {};
+  }
+  rebuildCueBtns();
+}
+
+document.getElementById("engine_db_path").addEventListener("change", () => {
+  const fn = searchEl.value.trim();
+  if (fn) loadHotcues(fn);
+});
+
+// ── cue buttons ────────────────────────────────────────────────────────────
+function makeCueBtns(containerId, selectedKey, timeId, onSelect) {
+  const container = document.getElementById(containerId);
+  const timeEl    = document.getElementById(timeId);
+  container.innerHTML = "";
+
+  for (let n = 1; n <= 8; n++) {
+    const btn    = document.createElement("button");
+    btn.className = "cue-btn";
+    btn.textContent = n;
+    btn.dataset.cue = n;
+    if (hotcues[n] !== undefined) btn.classList.add("has-cue");
+    if (n === selectedKey)        btn.classList.add("selected");
+    btn.addEventListener("click", () => {
+      container.querySelectorAll(".cue-btn").forEach(b => b.classList.remove("selected"));
+      btn.classList.add("selected");
+      onSelect(n);
+      timeEl.textContent = hotcues[n] !== undefined ? fmtSecs(hotcues[n]) : "";
+    });
+    container.appendChild(btn);
+  }
+  timeEl.textContent = hotcues[selectedKey] !== undefined ? fmtSecs(hotcues[selectedKey]) : "";
+}
+
+function rebuildCueBtns() {
+  makeCueBtns("cbc-start-btns", state.cut_between_start || 1, "cbc-start-time", v => { state.cut_between_start = v; });
+  makeCueBtns("cbc-end-btns",   state.cut_between_end   || 2, "cbc-end-time",   v => { state.cut_between_end   = v; });
+  makeCueBtns("cte-btns",       state.cut_to_end_hotcue || 1, "cte-time",       v => { state.cut_to_end_hotcue = v; });
+  makeCueBtns("as-btns",        state.add_silence_cue   || 1, "as-time",        v => { state.add_silence_cue   = v; });
+}
+
+function fmtSecs(s) {
+  const m = Math.floor(s / 60);
+  const r = s - m * 60;
+  return `${m}:${r.toFixed(2).padStart(5, "0")}`;
+}
+
+// ── run ────────────────────────────────────────────────────────────────────
+document.getElementById("run-btn").addEventListener("click", async () => {
+  const filename = searchEl.value.trim();
+  if (!filename) { alert("Select or enter a track filename first."); return; }
+
+  const params = {
+    track_filename:  filename,
+    output_appendix: document.getElementById("output_appendix").value.trim(),
+    output_path:     document.getElementById("output_path").value.trim(),
+    engine_db_path:  document.getElementById("engine_db_path").value.trim(),
+    mode:            currentMode,
+
+    // CUT_BETWEEN_CUES
+    cut_between_start: state.cut_between_start || 1,
+    cut_between_end:   state.cut_between_end   || 2,
+
+    // CUT_TO_END
+    cut_to_end_hotcue:            state.cut_to_end_hotcue || 1,
+    cut_to_end_reverb_tail:       getToggle("reverb-toggle-btn"),
+    cut_to_end_reverb_room_size:  parseFloat(document.getElementById("reverb_room_size").value),
+    cut_to_end_reverb_damping:    parseFloat(document.getElementById("reverb_damping").value),
+    cut_to_end_reverb_wet_level:  parseFloat(document.getElementById("reverb_wet_level").value),
+    cut_to_end_reverb_width:      parseFloat(document.getElementById("reverb_width").value),
+    cut_to_end_reverb_tail_secs:  parseFloat(document.getElementById("reverb_tail_secs").value),
+    cut_to_end_reverb_blend_secs: parseFloat(document.getElementById("reverb_blend_secs").value),
+
+    // ADD_SILENCE
+    add_silence_use_cue:       getToggle("silence-cue-toggle"),
+    add_silence_cue:           state.add_silence_cue || 1,
+    add_silence_timestamp:     parseFloat(document.getElementById("add_silence_timestamp").value),
+    add_silence_duration_secs: parseFloat(document.getElementById("add_silence_duration_secs").value),
+
+    // COMPRESS
+    compress_bitrate:        parseInt(document.querySelector(".tab[data-bitrate].active")?.dataset.bitrate || 320),
+    compress_remove_artwork: getToggle("artwork-toggle"),
+  };
+
+  // persist state
+  state = { ...state, ...params };
+
+  const logCard = document.getElementById("log-card");
+  const logEl   = document.getElementById("log");
+  const runBtn  = document.getElementById("run-btn");
+
+  logCard.style.display = "block";
+  logEl.innerHTML = "";
+  runBtn.disabled = true;
+  runBtn.textContent = "Running…";
+
+  await fetch("/api/run", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(params),
+  });
+
+  pollStatus(logEl, runBtn);
+});
+
+async function pollStatus(logEl, runBtn) {
+  let lastLen = 0;
+  const timer = setInterval(async () => {
+    const s = await fetch("/api/status").then(r => r.json());
+
+    // append new lines
+    const newLines = s.log.slice(lastLen);
+    lastLen = s.log.length;
+    newLines.forEach(line => {
+      const el = document.createElement("div");
+      el.textContent = line;
+      logEl.appendChild(el);
+    });
+    logEl.scrollTop = logEl.scrollHeight;
+
+    if (!s.running) {
+      clearInterval(timer);
+      runBtn.disabled    = false;
+      runBtn.textContent = "Run";
+      const done = document.createElement("div");
+      done.textContent = s.success ? "✓ Done" : "✗ Failed";
+      done.className   = s.success ? "log-success" : "log-error";
+      logEl.appendChild(done);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+  }, 500);
+}
+
+boot();
+</script>
+</body>
+</html>
