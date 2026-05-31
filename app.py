@@ -42,6 +42,10 @@ DEFAULT_STATE = {
     "add_silence_duration_secs": 1.0,
     "compress_bitrate": 320,
     "compress_remove_artwork": False,
+    "copy_src_start_cue": 1,
+    "copy_src_end_cue": 2,
+    "copy_dst_start_cue": 3,
+    "copy_dst_end_cue": None,
 }
 
 
@@ -202,6 +206,13 @@ def run_job(params: dict):
     elif params["mode"] == "COMPRESS":
         mod.COMPRESS_BITRATE        = int(params.get("compress_bitrate", 320))
         mod.COMPRESS_REMOVE_ARTWORK = bool(params.get("compress_remove_artwork", False))
+
+    elif params["mode"] == "COPY_BEATS_BETWEEN_CUES":
+        mod.COPY_SRC_START_CUE = int(params["copy_src_start_cue"])
+        mod.COPY_SRC_END_CUE   = int(params["copy_src_end_cue"])
+        mod.COPY_DST_START_CUE = int(params["copy_dst_start_cue"])
+        raw_dst_end = params.get("copy_dst_end_cue")
+        mod.COPY_DST_END_CUE   = int(raw_dst_end) if raw_dst_end not in (None, "", 0, "0") else None
 
     buf = io.StringIO()
     try:

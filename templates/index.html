@@ -222,6 +222,7 @@
       <button class="tab" data-mode="CUT_TO_END">Cut to end</button>
       <button class="tab" data-mode="ADD_SILENCE">Add silence</button>
       <button class="tab" data-mode="COMPRESS">Compress</button>
+      <button class="tab" data-mode="COPY_BEATS_BETWEEN_CUES">Copy beats</button>
     </div>
   </div>
 
@@ -349,6 +350,43 @@
     </div>
   </div>
 
+  <!-- ── COPY_BEATS_BETWEEN_CUES ───────────────────────── -->
+  <div class="card mode-panel" id="panel-COPY_BEATS_BETWEEN_CUES">
+    <h2>Copy beats between cues</h2>
+    <p class="hint" style="margin-bottom:14px;">
+      Copy the audio between two cues and mix it on top of a destination region.
+      If only a start cue is given for the destination, one repetition is pasted
+      (the track extends if needed). If both destination cues are given, the paste
+      length must be a multiple of the copy length.
+    </p>
+    <div class="grid2">
+      <div class="field">
+        <label>Copy from</label>
+        <div class="cue-grid" id="cb-src-start-btns"></div>
+        <div class="cue-time" id="cb-src-start-time"></div>
+      </div>
+      <div class="field">
+        <label>Copy to</label>
+        <div class="cue-grid" id="cb-src-end-btns"></div>
+        <div class="cue-time" id="cb-src-end-time"></div>
+      </div>
+    </div>
+    <hr class="sep" style="margin:10px 0;">
+    <div class="grid2">
+      <div class="field">
+        <label>Paste start</label>
+        <div class="cue-grid" id="cb-dst-start-btns"></div>
+        <div class="cue-time" id="cb-dst-start-time"></div>
+      </div>
+      <div class="field">
+        <label>Paste end <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(optional)</span></label>
+        <div class="cue-grid" id="cb-dst-end-btns"></div>
+        <div class="cue-time" id="cb-dst-end-time"></div>
+        <div class="hint">Leave unselected for 1 repetition / track extension.</div>
+      </div>
+    </div>
+  </div>
+
   <!-- ── Run ───────────────────────────────────────────── -->
   <button id="run-btn">Run</button>
 
@@ -406,6 +444,12 @@ function applyState() {
   document.getElementById("add_silence_timestamp").value    = state.add_silence_timestamp    ?? 0;
   document.getElementById("add_silence_duration_secs").value = state.add_silence_duration_secs ?? 1.0;
 
+  // Copy beats — initialise state keys so rebuildCueBtns sees them
+  state.copy_src_start_cue = state.copy_src_start_cue ?? 1;
+  state.copy_src_end_cue   = state.copy_src_end_cue   ?? 2;
+  state.copy_dst_start_cue = state.copy_dst_start_cue ?? 3;
+  state.copy_dst_end_cue   = state.copy_dst_end_cue   ?? null;
+
   updateSilenceSourceUI();
   setBitrateTab(state.compress_bitrate || 320);
   updateReverbParamsVisibility();
@@ -413,10 +457,11 @@ function applyState() {
 
 // ── mode ───────────────────────────────────────────────────────────────────
 const MODE_DEFAULTS = {
-  CUT_BETWEEN_CUES: "(Short Edit)",
-  CUT_TO_END:       "(Short Edit)",
-  ADD_SILENCE:      "(Added Silence)",
-  COMPRESS:         "LQ",
+  CUT_BETWEEN_CUES:        "(Short Edit)",
+  CUT_TO_END:              "(Short Edit)",
+  ADD_SILENCE:             "(Added Silence)",
+  COMPRESS:                "LQ",
+  COPY_BEATS_BETWEEN_CUES: "(Loop Edit)",
 };
 
 function setMode(mode) {
@@ -602,11 +647,53 @@ function makeCueBtns(containerId, selectedKey, timeId, onSelect) {
   timeEl.textContent = hotcues[selectedKey] !== undefined ? fmtSecs(hotcues[selectedKey]) : "";
 }
 
+function makeCueBtnsOptional(containerId, selectedKey, timeId, onSelect) {
+  // Like makeCueBtns but includes a "–" (none) button; selectedKey=null means none selected.
+  const container = document.getElementById(containerId);
+  const timeEl    = document.getElementById(timeId);
+  container.innerHTML = "";
+
+  // "None" button
+  const noneBtn = document.createElement("button");
+  noneBtn.className = "cue-btn" + (selectedKey === null ? " selected" : "");
+  noneBtn.textContent = "–";
+  noneBtn.title = "No end cue (1 repetition)";
+  noneBtn.addEventListener("click", () => {
+    container.querySelectorAll(".cue-btn").forEach(b => b.classList.remove("selected"));
+    noneBtn.classList.add("selected");
+    onSelect(null);
+    timeEl.textContent = "";
+  });
+  container.appendChild(noneBtn);
+
+  for (let n = 1; n <= 8; n++) {
+    const btn = document.createElement("button");
+    btn.className = "cue-btn";
+    btn.textContent = n;
+    btn.dataset.cue = n;
+    if (hotcues[n] !== undefined) btn.classList.add("has-cue");
+    if (n === selectedKey)        btn.classList.add("selected");
+    btn.addEventListener("click", () => {
+      container.querySelectorAll(".cue-btn").forEach(b => b.classList.remove("selected"));
+      btn.classList.add("selected");
+      onSelect(n);
+      timeEl.textContent = hotcues[n] !== undefined ? fmtSecs(hotcues[n]) : "";
+    });
+    container.appendChild(btn);
+  }
+  timeEl.textContent = (selectedKey !== null && hotcues[selectedKey] !== undefined)
+    ? fmtSecs(hotcues[selectedKey]) : "";
+}
+
 function rebuildCueBtns() {
   makeCueBtns("cbc-start-btns", state.cut_between_start || 1, "cbc-start-time", v => { state.cut_between_start = v; });
   makeCueBtns("cbc-end-btns",   state.cut_between_end   || 2, "cbc-end-time",   v => { state.cut_between_end   = v; });
   makeCueBtns("cte-btns",       state.cut_to_end_hotcue || 1, "cte-time",       v => { state.cut_to_end_hotcue = v; });
   makeCueBtns("as-btns",        state.add_silence_cue   || 1, "as-time",        v => { state.add_silence_cue   = v; });
+  makeCueBtns("cb-src-start-btns", state.copy_src_start_cue || 1, "cb-src-start-time", v => { state.copy_src_start_cue = v; });
+  makeCueBtns("cb-src-end-btns",   state.copy_src_end_cue   || 2, "cb-src-end-time",   v => { state.copy_src_end_cue   = v; });
+  makeCueBtns("cb-dst-start-btns", state.copy_dst_start_cue || 3, "cb-dst-start-time", v => { state.copy_dst_start_cue = v; });
+  makeCueBtnsOptional("cb-dst-end-btns", state.copy_dst_end_cue ?? null, "cb-dst-end-time", v => { state.copy_dst_end_cue = v; });
 }
 
 function fmtSecs(s) {
@@ -650,6 +737,12 @@ document.getElementById("run-btn").addEventListener("click", async () => {
     // COMPRESS
     compress_bitrate:        parseInt(document.querySelector(".tab[data-bitrate].active")?.dataset.bitrate || 320),
     compress_remove_artwork: getToggle("artwork-toggle"),
+
+    // COPY_BEATS_BETWEEN_CUES
+    copy_src_start_cue: state.copy_src_start_cue || 1,
+    copy_src_end_cue:   state.copy_src_end_cue   || 2,
+    copy_dst_start_cue: state.copy_dst_start_cue || 3,
+    copy_dst_end_cue:   state.copy_dst_end_cue   ?? null,
   };
 
   // persist state

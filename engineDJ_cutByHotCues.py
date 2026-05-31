@@ -2,11 +2,12 @@
 """
 Audio Editor — Edit MP3, FLAC, WAV, or M4A files using Engine DJ hotcues.
 
-Four modes:
-  CUT_BETWEEN_CUES — remove audio between two hotcue positions
-  CUT_TO_END       — remove audio from a hotcue to the end of the track
-  ADD_SILENCE      — insert a block of silence at a hotcue or a timestamp
-  COMPRESS         — convert FLAC/WAV/M4A to MP3, or re-encode MP3 at a lower bitrate
+Five modes:
+  CUT_BETWEEN_CUES       — remove audio between two hotcue positions
+  CUT_TO_END             — remove audio from a hotcue to the end of the track
+  ADD_SILENCE            — insert a block of silence at a hotcue or a timestamp
+  COMPRESS               — convert FLAC/WAV/M4A to MP3, or re-encode MP3 at a lower bitrate
+  COPY_BEATS_BETWEEN_CUES — copy a section and mix it onto another section (or extend the track)
 
 FLAC and WAV are edited sample-accurately with zero-crossing snap.
 MP3 is edited frame-accurately (lossless, no re-encoding).
@@ -46,10 +47,12 @@ from mutagen.wave import WAVE
 
 # ── Operation mode ────────────────────────────────────────────────────────────
 # Choose what the script should do, then fill in the matching section below:
-#   "CUT_BETWEEN_CUES" — delete the audio between HOTCUE_START and HOTCUE_END
-#   "CUT_TO_END"       — delete everything from HOTCUE_START to end of track
-#   "ADD_SILENCE"      — insert a block of silence at SILENCE_CUE or SILENCE_TIMESTAMP
-#   "COMPRESS"         — convert FLAC/WAV to MP3, or re-encode MP3 at a lower bitrate
+#   "CUT_BETWEEN_CUES"        — delete the audio between HOTCUE_START and HOTCUE_END
+#   "CUT_TO_END"              — delete everything from HOTCUE_START to end of track
+#   "ADD_SILENCE"             — insert a block of silence at SILENCE_CUE or SILENCE_TIMESTAMP
+#   "COMPRESS"                — convert FLAC/WAV to MP3, or re-encode MP3 at a lower bitrate
+#   "COPY_BEATS_BETWEEN_CUES" — copy [SRC_START, SRC_END) and mix onto DST_START
+#                               (and optionally DST_END; paste length must be N× copy length)
 MODE = "CUT_BETWEEN_CUES"
 
 # ── Shared settings (used by every mode) ──────────────────────────────────────
@@ -85,6 +88,20 @@ ADD_SILENCE_DURATION_SECS = 1     # length of the inserted silence in seconds
 #   128 kbps → ~3.8 MB   192 kbps → ~5.6 MB   256 kbps → ~7.5 MB   320 kbps → ~9.4 MB
 COMPRESS_BITRATE         = 320   # output MP3 bitrate in kbps (e.g. 128, 192, 256, 320)
 COMPRESS_REMOVE_ARTWORK  = False  # True = strip embedded artwork (reduces file size)
+
+# ── COPY_BEATS_BETWEEN_CUES settings ─────────────────────────────────────────
+# Copy the section [COPY_SRC_START_CUE, COPY_SRC_END_CUE) and mix it on top of
+# the existing audio starting at COPY_DST_START_CUE.
+#
+# Paste length / number of repetitions:
+#   • COPY_DST_END_CUE = None  →  one repetition; if the paste extends past the
+#     end of the track the track is extended (good for building an outro).
+#   • COPY_DST_END_CUE = <cue> →  paste region is [DST_START, DST_END); its
+#     length must be a multiple of the copy length (warning is printed if not).
+COPY_SRC_START_CUE = 1   # hotcue number (1–8): start of the section to copy
+COPY_SRC_END_CUE   = 2   # hotcue number (1–8): end of the section to copy
+COPY_DST_START_CUE = 3   # hotcue number (1–8): where to start pasting
+COPY_DST_END_CUE   = None  # hotcue number (1–8) or None
 
 # ── Example — CUT_TO_END on a different track ─────────────────────────────────
 # MODE                 = "CUT_TO_END"
@@ -639,7 +656,7 @@ def _reverb_outro(pcm, sample_rate, blend_in=True):
 
     modified = pcm_2d.copy()  # (n_samples, n_ch)
     if blend_in:
-    blend_n = min(len(modified), int(sample_rate * CUT_TO_END_REVERB_BLEND_SECS))
+        blend_n = min(len(modified), int(sample_rate * CUT_TO_END_REVERB_BLEND_SECS))
         ramp = np.linspace(0.0, 1.0, blend_n, dtype=np.float32)
         modified[-blend_n:] += (reverb_out[:, -blend_n:].T * ramp[:, np.newaxis]).astype(np.float64)
 
@@ -1154,6 +1171,370 @@ def compress_to_mp3(input_path, output_path, bitrate_kbps, remove_artwork=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Copy-beats mixing helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end=None):
+    """Mix (add) PCM samples from [src_start, src_end) onto the track starting
+    at dst_start.
+
+    dst_end=None  → one repetition; the track is extended if the paste goes past
+                    the current end.
+    dst_end given → the paste window [dst_start, dst_end) must be N× the copy
+                    length; a warning is printed if not.
+
+    pcm must be (n_samples, n_channels) float64.
+    Returns the modified pcm array (may be longer than the original).
+    """
+    pcm = pcm.copy()
+    total = len(pcm)
+    n_ch = pcm.shape[1] if pcm.ndim > 1 else 1
+
+    src_start = int(round(src_start))
+    src_end   = int(round(src_end))
+    dst_start = int(round(dst_start))
+
+    copy_len = src_end - src_start
+    if copy_len <= 0:
+        print("Warning: Copy region is empty — nothing to paste.")
+        return pcm
+
+    copy_pcm = pcm[src_start:src_end]  # (copy_len, n_ch)
+
+    if dst_end is None:
+        n_reps = 1
+    else:
+        dst_end  = int(round(dst_end))
+        paste_len = dst_end - dst_start
+        n_reps_f  = paste_len / copy_len
+        n_reps    = round(n_reps_f)
+        if abs(n_reps_f - n_reps) > 0.05:
+            print(
+                f"Warning: Paste length ({paste_len} samples, {paste_len / sample_rate:.3f} s) "
+                f"is not a whole multiple of copy length ({copy_len} samples, "
+                f"{copy_len / sample_rate:.3f} s). "
+                f"Ratio = {n_reps_f:.3f} — rounding to {n_reps} repetition(s)."
+            )
+
+    needed_end = dst_start + n_reps * copy_len
+    if needed_end > total:
+        # Extend the array with zeros so the paste fits
+        extra = needed_end - total
+        pcm = np.concatenate([pcm, np.zeros((extra, n_ch), dtype=np.float64)])
+
+    for rep in range(n_reps):
+        off = dst_start + rep * copy_len
+        pcm[off:off + copy_len] += copy_pcm
+
+    # Soft-clip to [-1, 1] using tanh to avoid hard clipping artefacts
+    pcm = np.tanh(pcm)
+
+    return pcm
+
+
+# ─── FLAC ───────────────────────────────────────────────────────────────────
+
+def copy_beats_flac(input_path, output_path, src_start, src_end, dst_start, dst_end=None):
+    info = sf.info(input_path)
+    sample_rate = info.samplerate
+    subtype = info.subtype
+
+    pcm, _ = sf.read(input_path, dtype="float64", always_2d=True)
+    pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end)
+
+    sf.write(output_path, pcm, sample_rate, subtype=subtype, format="FLAC")
+    _copy_metadata(input_path, output_path, ".flac")
+
+    _print_copy_stats(sample_rate, src_start, src_end, dst_start, dst_end, len(pcm), output_path)
+
+
+# ─── WAV ────────────────────────────────────────────────────────────────────
+
+def copy_beats_wav(input_path, output_path, src_start, src_end, dst_start, dst_end=None):
+    info = sf.info(input_path)
+    sample_rate = info.samplerate
+    subtype = info.subtype
+
+    pcm, _ = sf.read(input_path, dtype="float64", always_2d=True)
+    pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end)
+
+    sf.write(output_path, pcm, sample_rate, subtype=subtype, format="WAV")
+    _copy_metadata(input_path, output_path, ".wav")
+
+    _print_copy_stats(sample_rate, src_start, src_end, dst_start, dst_end, len(pcm), output_path)
+
+
+# ─── M4A ────────────────────────────────────────────────────────────────────
+
+def copy_beats_m4a(input_path, output_path, src_start, src_end, dst_start, dst_end=None):
+    try:
+        m4a_info            = MP4(input_path)
+        encode_bitrate_kbps = max(128, min(320, m4a_info.info.bitrate // 1000))
+        sample_rate         = m4a_info.info.sample_rate
+    except Exception:
+        encode_bitrate_kbps = 256
+        sample_rate         = 44100
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_wav     = os.path.join(tmp_dir, "decoded.wav")
+        tmp_out_wav = os.path.join(tmp_dir, "processed.wav")
+
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", input_path, tmp_wav],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(f"Error: ffmpeg decode failed:\n{r.stderr}")
+            sys.exit(1)
+
+        info = sf.info(tmp_wav)
+        sample_rate = info.samplerate
+        subtype     = info.subtype
+        pcm, _ = sf.read(tmp_wav, dtype="float64", always_2d=True)
+        pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end)
+
+        sf.write(tmp_out_wav, pcm, sample_rate, subtype=subtype, format="WAV")
+
+        enc = subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp_out_wav,
+             "-codec:a", "aac", "-b:a", f"{encode_bitrate_kbps}k", output_path],
+            capture_output=True, text=True,
+        )
+        if enc.returncode != 0:
+            print(f"Error: ffmpeg encode failed:\n{enc.stderr}")
+            sys.exit(1)
+
+    _copy_metadata(input_path, output_path, ".m4a")
+    _print_copy_stats(sample_rate, src_start, src_end, dst_start, dst_end, len(pcm), output_path)
+
+
+# ─── MP3 ────────────────────────────────────────────────────────────────────
+
+def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_end=None):
+    """Mix the copy region onto the MP3, re-encoding only the frames that overlap
+    the paste zone.  All other frames are byte-copied untouched.
+
+    Strategy:
+      1. Parse all frames and determine the paste window in sample-space.
+      2. Decode the full track to PCM via pedalboard (or ffmpeg fallback).
+      3. Mix the copy onto the PCM.
+      4. Re-encode only the paste-window frames from the mixed PCM.
+      5. Reassemble: original bytes before window | re-encoded bytes | original
+         bytes after window; append any new frames if the track was extended.
+    """
+    if not _HAS_PEDALBOARD:
+        sys.exit("Missing dependency: pedalboard\nInstall with: pip install pedalboard")
+
+    with open(input_path, "rb") as f:
+        raw = f.read()
+
+    id3v2_size = read_id3v2_size(raw)
+    id3v2_data = raw[:id3v2_size]
+
+    id3v1_data = b""
+    audio_end  = len(raw)
+    if len(raw) >= 128 and raw[-128:-125] == b"TAG":
+        id3v1_data = raw[-128:]
+        audio_end -= 128
+
+    # --- Pass 1: index all frames -------------------------------------------
+    frames = []   # (file_offset, frame_size, start_sample)
+    pos = id3v2_size
+    current_sample = 0
+    file_sample_rate = None
+    spf = None
+
+    while pos + 4 <= audio_end:
+        info = parse_frame_header(raw[pos:pos + 4])
+        if info is None:
+            pos += 1
+            continue
+        if file_sample_rate is None:
+            file_sample_rate = info["sample_rate"]
+            spf = info["samples_per_frame"]
+        frame_end = pos + info["frame_size"]
+        if frame_end > audio_end:
+            break
+        frames.append((pos, info["frame_size"], current_sample))
+        current_sample += info["samples_per_frame"]
+        pos = frame_end
+
+    if not frames:
+        print("Error: No valid MP3 frames found.")
+        sys.exit(1)
+
+    sr  = file_sample_rate
+    src_start_i = int(round(src_start))
+    src_end_i   = int(round(src_end))
+    dst_start_i = int(round(dst_start))
+    copy_len    = src_end_i - src_start_i
+
+    # Determine number of reps / warn
+    if dst_end is None:
+        n_reps = 1
+    else:
+        dst_end_i  = int(round(dst_end))
+        paste_len  = dst_end_i - dst_start_i
+        n_reps_f   = paste_len / copy_len
+        n_reps     = round(n_reps_f)
+        if abs(n_reps_f - n_reps) > 0.05:
+            print(
+                f"Warning: Paste length ({paste_len} samples, {paste_len / sr:.3f} s) "
+                f"is not a whole multiple of copy length ({copy_len} samples, "
+                f"{copy_len / sr:.3f} s). "
+                f"Ratio = {n_reps_f:.3f} — rounding to {n_reps} repetition(s)."
+            )
+
+    paste_end_sample = dst_start_i + n_reps * copy_len
+    total_original_samples = current_sample
+
+    # --- Decode full track to PCM -------------------------------------------
+    with PbAudioFile(input_path) as af:
+        pcm_t = af.read(af.frames)   # (n_ch, n_samples) float32
+    pcm = pcm_t.T.astype(np.float64)  # (n_samples, n_ch)
+
+    n_ch = pcm.shape[1] if pcm.ndim > 1 else 1
+    pcm_mixed = _mix_copy_onto_pcm(pcm, sr, src_start_i, src_end_i, dst_start_i,
+                                   None if dst_end is None else int(round(dst_end)))
+
+    # --- Identify which existing frames overlap the paste window ------------
+    # paste window in sample space: [dst_start_i, paste_end_sample)
+    first_paste_frame = None
+    last_paste_frame  = None  # inclusive
+    for idx, (_, fsize, fsample) in enumerate(frames):
+        f_end = fsample + spf
+        if f_end > dst_start_i and fsample < paste_end_sample:
+            if first_paste_frame is None:
+                first_paste_frame = idx
+            last_paste_frame = idx
+
+    # --- Re-encode the paste-window PCM slice as new MP3 frames -------------
+    # We re-encode from first_paste_frame.start_sample to
+    # max(last_paste_frame.end_sample, paste_end_sample) so every mixed sample
+    # is covered.
+    reenc_bytes = b""
+    extension_bytes = b""
+
+    if first_paste_frame is not None:
+        reenc_start_sample = frames[first_paste_frame][2]
+        reenc_end_sample   = (
+            frames[last_paste_frame][2] + spf
+            if last_paste_frame is not None
+            else paste_end_sample
+        )
+        reenc_end_sample = max(reenc_end_sample, paste_end_sample)
+        reenc_end_sample = min(reenc_end_sample, len(pcm_mixed))
+
+        pcm_slice = pcm_mixed[reenc_start_sample:reenc_end_sample]
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(tmp_fd)
+        try:
+            # Detect bitrate from first non-Xing frame for consistent quality
+            sample_bitrate = None
+            for foff, fsize, _ in frames:
+                hdr = parse_frame_header(raw[foff:foff + 4])
+                if hdr:
+                    sample_bitrate = int(struct.unpack(">I", raw[foff:foff + 4])[0])
+                    break
+            with PbAudioFile(tmp_path, "w", samplerate=sr, num_channels=n_ch) as af:
+                af.write(pcm_slice.T.astype(np.float32))
+            with open(tmp_path, "rb") as f:
+                reenc_raw = f.read()
+        finally:
+            os.unlink(tmp_path)
+
+        reenc_id3 = read_id3v2_size(reenc_raw)
+        reenc_audio = reenc_raw[reenc_id3:]
+        if len(reenc_audio) >= 128 and reenc_audio[-128:-125] == b"TAG":
+            reenc_audio = reenc_audio[:-128]
+        reenc_bytes = reenc_audio
+
+    # If the paste extends past the original track end, encode the extra PCM
+    if paste_end_sample > total_original_samples:
+        extra_pcm = pcm_mixed[total_original_samples:paste_end_sample]
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(tmp_fd)
+        try:
+            with PbAudioFile(tmp_path, "w", samplerate=sr, num_channels=n_ch) as af:
+                af.write(extra_pcm.T.astype(np.float32))
+            with open(tmp_path, "rb") as f:
+                ext_raw = f.read()
+        finally:
+            os.unlink(tmp_path)
+        ext_id3 = read_id3v2_size(ext_raw)
+        ext_audio = ext_raw[ext_id3:]
+        if len(ext_audio) >= 128 and ext_audio[-128:-125] == b"TAG":
+            ext_audio = ext_audio[:-128]
+        extension_bytes = ext_audio
+
+    # --- Assemble output ----------------------------------------------------
+    before_bytes = b"".join(
+        raw[foff:foff + fsize]
+        for foff, fsize, _ in frames[:first_paste_frame]
+    ) if first_paste_frame is not None else b"".join(
+        raw[foff:foff + fsize] for foff, fsize, _ in frames
+    )
+
+    after_start = last_paste_frame + 1 if last_paste_frame is not None else len(frames)
+    after_bytes = b"".join(
+        raw[foff:foff + fsize]
+        for foff, fsize, _ in frames[after_start:]
+    )
+
+    # Count new frames for Xing header update
+    def _count_mp3_frames(data):
+        n, p = 0, 0
+        while p + 4 <= len(data):
+            h = parse_frame_header(data[p:p + 4])
+            if h is None:
+                p += 1
+                continue
+            p += h["frame_size"]
+            n += 1
+        return n
+
+    new_audio = before_bytes + reenc_bytes + after_bytes + extension_bytes
+    new_frame_count = _count_mp3_frames(new_audio)
+    new_byte_count  = len(new_audio)
+
+    with open(output_path, "wb") as f:
+        f.write(id3v2_data)
+        # Patch Xing header in first frame
+        first_frame_written = False
+        for chunk in (before_bytes, reenc_bytes, after_bytes, extension_bytes):
+            if chunk and not first_frame_written:
+                chunk = _patch_xing_header(chunk, new_frame_count, new_byte_count)
+                first_frame_written = True
+            f.write(chunk)
+        f.write(id3v1_data)
+
+    _print_copy_stats(sr, src_start_i, src_end_i, dst_start_i,
+                      None if dst_end is None else int(round(dst_end)),
+                      len(pcm_mixed), output_path,
+                      reenc_frame_count=_count_mp3_frames(reenc_bytes))
+
+
+def _print_copy_stats(sample_rate, src_start, src_end, dst_start, dst_end,
+                      new_total_samples, output_path, reenc_frame_count=None):
+    copy_len = src_end - src_start
+    if dst_end is not None:
+        n_reps = round((dst_end - dst_start) / copy_len)
+    else:
+        n_reps = 1
+    print(f"\n  Copy source   : {src_start / sample_rate:.3f} s – {src_end / sample_rate:.3f} s "
+          f"({copy_len} samples, {copy_len / sample_rate:.3f} s)")
+    print(f"  Paste start   : {dst_start / sample_rate:.3f} s")
+    if dst_end is not None:
+        print(f"  Paste end     : {dst_end / sample_rate:.3f} s")
+    print(f"  Repetitions   : {n_reps}")
+    print(f"  New duration  : ~{new_total_samples / sample_rate:.2f} s")
+    if reenc_frame_count is not None:
+        print(f"  Re-enc frames : {reenc_frame_count}  (all other frames byte-copied)")
+    print(f"  Output file   : {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1326,8 +1707,67 @@ def main():
         print(f"\nCompressing to MP3 at {COMPRESS_BITRATE} kbps …")
         compress_to_mp3(track_abs_path, output_filepath, COMPRESS_BITRATE, COMPRESS_REMOVE_ARTWORK)
 
+    elif MODE == "COPY_BEATS_BETWEEN_CUES":
+        hotcues = get_hotcues(ENGINE_DB_PATH, track_id)
+        print(f"\n  Available hotcues:")
+        for num in sorted(hotcues):
+            secs = hotcues[num] / 44100
+            mins = int(secs) // 60
+            remainder = secs - mins * 60
+            print(f"    Cue {num}:  {mins}:{remainder:05.2f}  ({hotcues[num]:.0f} samples)")
+
+        for label, cue_num in [
+            ("COPY_SRC_START_CUE", COPY_SRC_START_CUE),
+            ("COPY_SRC_END_CUE",   COPY_SRC_END_CUE),
+            ("COPY_DST_START_CUE", COPY_DST_START_CUE),
+        ]:
+            if cue_num not in hotcues:
+                print(f"\nError: {label} hotcue {cue_num} is not set on this track.")
+                sys.exit(1)
+
+        if COPY_DST_END_CUE is not None and COPY_DST_END_CUE not in hotcues:
+            print(f"\nError: COPY_DST_END_CUE hotcue {COPY_DST_END_CUE} is not set on this track.")
+            sys.exit(1)
+
+        src_start = hotcues[COPY_SRC_START_CUE]
+        src_end   = hotcues[COPY_SRC_END_CUE]
+        dst_start = hotcues[COPY_DST_START_CUE]
+        dst_end   = hotcues[COPY_DST_END_CUE] if COPY_DST_END_CUE is not None else None
+
+        if src_start >= src_end:
+            print(
+                f"\nError: COPY_SRC_START_CUE ({src_start:.0f}) must be before "
+                f"COPY_SRC_END_CUE ({src_end:.0f})."
+            )
+            sys.exit(1)
+        if dst_end is not None and dst_start >= dst_end:
+            print(
+                f"\nError: COPY_DST_START_CUE ({dst_start:.0f}) must be before "
+                f"COPY_DST_END_CUE ({dst_end:.0f})."
+            )
+            sys.exit(1)
+
+        desc_dst = (
+            f"Cue {COPY_DST_START_CUE} – Cue {COPY_DST_END_CUE}"
+            if COPY_DST_END_CUE is not None
+            else f"Cue {COPY_DST_START_CUE} (1 rep, extend if needed)"
+        )
+        print(
+            f"\nCopying Cue {COPY_SRC_START_CUE}–{COPY_SRC_END_CUE} "
+            f"onto {desc_dst} …"
+        )
+
+        if ext_lower == ".mp3":
+            copy_beats_mp3(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end)
+        elif ext_lower == ".flac":
+            copy_beats_flac(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end)
+        elif ext_lower == ".m4a":
+            copy_beats_m4a(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end)
+        else:
+            copy_beats_wav(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end)
+
     else:
-        print(f"Error: Unknown MODE '{MODE}'. Valid options: CUT_BETWEEN_CUES, CUT_TO_END, ADD_SILENCE, COMPRESS")
+        print(f"Error: Unknown MODE '{MODE}'. Valid options: CUT_BETWEEN_CUES, CUT_TO_END, ADD_SILENCE, COMPRESS, COPY_BEATS_BETWEEN_CUES")
         sys.exit(1)
 
     # ── Update the embedded track title ───────────────────────────────────────
