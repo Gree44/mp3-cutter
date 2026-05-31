@@ -25,7 +25,7 @@ try:
     import numpy as np
     import soundfile as sf
 except ImportError as exc:
-    sys.exit(f"Missing dependency: {exc}\nInstall with: pip install soundfile numpy")
+    sys.exit(f"Missing dependency: {exc}\nInstall with: pip install soundfile numpy mutagen")
 
 try:
     from pedalboard import Pedalboard, Reverb as PbReverb
@@ -59,19 +59,26 @@ OUTPUT_PATH     = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/D
 ENGINE_DB_PATH  = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
 
 # ── CUT_BETWEEN_CUES settings ─────────────────────────────────────────────────
-HOTCUE_START = 6   # hotcue number (1–8) where the cut begins
-HOTCUE_END   = 7   # hotcue number (1–8) where the cut ends
+CUT_BETWEEN_CUES_START = 6   # hotcue number (1–8) where the cut begins
+CUT_BETWEEN_CUES_END   = 7   # hotcue number (1–8) where the cut ends
 
 # ── CUT_TO_END settings ───────────────────────────────────────────────────────
-# (uses HOTCUE_START above — no additional variables needed)
+CUT_TO_END_HOTCUE            = 6      # hotcue number (1–8) where the cut begins
+CUT_TO_END_REVERB_TAIL       = True   # append reverb decay after the cut point
+CUT_TO_END_REVERB_ROOM_SIZE  = 1      # 0.0–1.0
+CUT_TO_END_REVERB_DAMPING    = 0.5    # 0.0–1.0
+CUT_TO_END_REVERB_WET_LEVEL  = 0.2    # 0.0–1.0  (tail amplitude)
+CUT_TO_END_REVERB_WIDTH      = 1.0    # stereo width 0.0–1.0
+CUT_TO_END_REVERB_TAIL_SECS  = 4.0    # seconds of decay to append
+CUT_TO_END_REVERB_BLEND_SECS = 0.1    # seconds before cut over which reverb fades in
 
 # ── ADD_SILENCE settings ──────────────────────────────────────────────────────
-# Set exactly one of SILENCE_CUE or SILENCE_TIMESTAMP to the insertion point;
+# Set exactly one of ADD_SILENCE_CUE or ADD_SILENCE_TIMESTAMP to the insertion point;
 # leave the other as None.  The silence is spliced in at that position; audio
 # before and after plays normally.
-SILENCE_CUE           = None   # hotcue number (1–8) that marks the insertion point, or None
-SILENCE_TIMESTAMP     = 0   # insertion point in seconds (float, e.g. 95.5), or None
-SILENCE_DURATION_SECS = 1    # length of the inserted silence in seconds
+ADD_SILENCE_CUE           = None  # hotcue number (1–8) that marks the insertion point, or None
+ADD_SILENCE_TIMESTAMP     = 0     # insertion point in seconds (float, e.g. 95.5), or None
+ADD_SILENCE_DURATION_SECS = 1     # length of the inserted silence in seconds
 
 # ── COMPRESS settings ─────────────────────────────────────────────────────────
 # Estimated MP3 size for a 4-minute track (duration × kbps ÷ 8):
@@ -80,27 +87,18 @@ COMPRESS_BITRATE         = 320   # output MP3 bitrate in kbps (e.g. 128, 192, 25
 COMPRESS_REMOVE_ARTWORK  = False  # True = strip embedded artwork (reduces file size)
 
 # ── Example — CUT_TO_END on a different track ─────────────────────────────────
-# MODE            = "CUT_TO_END"
-# TRACK_FILENAME  = "Britney Spears - Toxic.mp3"
-# HOTCUE_START    = 8
-# OUTPUT_APPENDIX = "(Cut End)"
-# OUTPUT_PATH     = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
-# ENGINE_DB_PATH  = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
+# MODE                 = "CUT_TO_END"
+# TRACK_FILENAME       = "Britney Spears - Toxic.mp3"
+# CUT_TO_END_HOTCUE    = 8
+# OUTPUT_APPENDIX      = "(Cut End)"
+# OUTPUT_PATH          = os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits")
+# ENGINE_DB_PATH       = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
 
 
 # Remap stale Engine DJ paths to their current locations when files have moved.
 PATH_REMAPS = [
     ("~/Music/OneDrive", "~/Library/CloudStorage/OneDrive-Personal"),
 ]
-
-# Reverb tail — only applied when cutting to end of track (HOTCUE_END = None).
-REVERB_TAIL       = True   # set True to append reverb decay after the cut point
-REVERB_ROOM_SIZE  = 1    # 0.0–1.0
-REVERB_DAMPING    = 0.5     # 0.0–1.0 
-REVERB_WET_LEVEL  = 0.2    # 0.0–1.0  (tail amplitude)
-REVERB_WIDTH      = 1.0     # stereo width 0.0–1.0
-REVERB_TAIL_SECS  = 4.0     # seconds of decay to append
-REVERB_BLEND_SECS = 0.1     # seconds before cut over which reverb fades in
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MP3 constants
@@ -579,8 +577,8 @@ def cut_mp3(input_path, output_path, cut_start_samples, cut_end_samples, reverb_
     print(f"  Actual cut    : {actual_length:.0f} samples ({actual_length / sr:.3f} s)")
     print(f"  Drift         : {drift:+.0f} samples ({drift / sr * 1000:+.2f} ms)")
     if reverb_tail:
-        print(f"  New duration  : ~{kept_dur + REVERB_TAIL_SECS:.2f} s")
-        print(f"  Reverb tail   : {REVERB_TAIL_SECS:.1f} s ({len(tail_mp3_bytes) / 1024:.1f} KB)")
+        print(f"  New duration  : ~{kept_dur + CUT_TO_END_REVERB_TAIL_SECS:.2f} s")
+        print(f"  Reverb tail   : {CUT_TO_END_REVERB_TAIL_SECS:.1f} s ({len(tail_mp3_bytes) / 1024:.1f} KB)")
     else:
         print(f"  New duration  : ~{(len(frames) - num_frames_to_cut) * spf / sr:.2f} s")
     print(f"  Output file   : {output_path}")
@@ -626,11 +624,11 @@ def _reverb_outro(pcm, sample_rate, blend_in=True):
         sys.exit("Missing dependency: pedalboard\nInstall with: pip install pedalboard")
 
     board = Pedalboard([PbReverb(
-        room_size=REVERB_ROOM_SIZE,
-        damping=REVERB_DAMPING,
-        wet_level=REVERB_WET_LEVEL,
+        room_size=CUT_TO_END_REVERB_ROOM_SIZE,
+        damping=CUT_TO_END_REVERB_DAMPING,
+        wet_level=CUT_TO_END_REVERB_WET_LEVEL,
         dry_level=0.0,
-        width=REVERB_WIDTH,
+        width=CUT_TO_END_REVERB_WIDTH,
     )])
 
     n_ch = pcm.shape[1] if pcm.ndim > 1 else 1
@@ -641,17 +639,17 @@ def _reverb_outro(pcm, sample_rate, blend_in=True):
 
     modified = pcm_2d.copy()  # (n_samples, n_ch)
     if blend_in:
-        blend_n = min(len(modified), int(sample_rate * REVERB_BLEND_SECS))
+    blend_n = min(len(modified), int(sample_rate * CUT_TO_END_REVERB_BLEND_SECS))
         ramp = np.linspace(0.0, 1.0, blend_n, dtype=np.float32)
         modified[-blend_n:] += (reverb_out[:, -blend_n:].T * ramp[:, np.newaxis]).astype(np.float64)
 
     # Flush reverb state with silence to get the decay tail
-    tail_samples = int(sample_rate * REVERB_TAIL_SECS)
+    tail_samples = int(sample_rate * CUT_TO_END_REVERB_TAIL_SECS)
     silence = np.zeros((n_ch, tail_samples), dtype=np.float32)
     tail = board(silence, sample_rate, reset=False)  # (n_ch, tail_samples)
 
     if not blend_in:
-        fade_in_n = min(tail.shape[1], int(sample_rate * REVERB_BLEND_SECS))
+        fade_in_n = min(tail.shape[1], int(sample_rate * CUT_TO_END_REVERB_BLEND_SECS))
         tail[:, :fade_in_n] *= np.linspace(0.0, 1.0, fade_in_n, dtype=np.float32)
 
     fade_out_n = min(tail.shape[1], int(sample_rate * 0.5))
@@ -1177,15 +1175,6 @@ def main():
         print(f"\nError: Audio file not found at resolved path:\n  {track_abs_path}")
         sys.exit(1)
 
-    # ── List all hotcues stored in the database ───────────────────────────────
-    hotcues = get_hotcues(ENGINE_DB_PATH, track_id)
-    print(f"\n  Available hotcues:")
-    for num in sorted(hotcues):
-        secs = hotcues[num] / 44100
-        mins = int(secs) // 60
-        remainder = secs - mins * 60
-        print(f"    Cue {num}:  {mins}:{remainder:05.2f}  ({hotcues[num]:.0f} samples)")
-
     # ── Validate audio format ─────────────────────────────────────────────────
     name, ext = os.path.splitext(track_fn)
     ext_lower = ext.lower()
@@ -1201,41 +1190,68 @@ def main():
 
     # ── Dispatch on MODE ──────────────────────────────────────────────────────
 
-    if MODE in ("CUT_BETWEEN_CUES", "CUT_TO_END"):
-        # Validate the start cue (required by both cut modes)
-        if HOTCUE_START not in hotcues:
-            print(f"\nError: Hotcue {HOTCUE_START} is not set on this track.")
+    if MODE == "CUT_BETWEEN_CUES":
+        hotcues = get_hotcues(ENGINE_DB_PATH, track_id)
+        print(f"\n  Available hotcues:")
+        for num in sorted(hotcues):
+            secs = hotcues[num] / 44100
+            mins = int(secs) // 60
+            remainder = secs - mins * 60
+            print(f"    Cue {num}:  {mins}:{remainder:05.2f}  ({hotcues[num]:.0f} samples)")
+
+        if CUT_BETWEEN_CUES_START not in hotcues:
+            print(f"\nError: Hotcue {CUT_BETWEEN_CUES_START} is not set on this track.")
+            sys.exit(1)
+        if CUT_BETWEEN_CUES_END not in hotcues:
+            print(f"\nError: Hotcue {CUT_BETWEEN_CUES_END} is not set on this track.")
             sys.exit(1)
 
-        cut_start = hotcues[HOTCUE_START]
+        cut_start = hotcues[CUT_BETWEEN_CUES_START]
+        cut_end   = hotcues[CUT_BETWEEN_CUES_END]
+        if cut_start >= cut_end:
+            print(
+                f"\nError: Hotcue {CUT_BETWEEN_CUES_START} ({cut_start:.0f} samples) must be "
+                f"before Hotcue {CUT_BETWEEN_CUES_END} ({cut_end:.0f} samples)."
+            )
+            sys.exit(1)
 
-        if MODE == "CUT_TO_END":
-            # Determine the sample offset of the very last sample in the file
-            if ext_lower in (".flac", ".wav"):
-                cut_end = sf.info(track_abs_path).frames
-            elif ext_lower == ".m4a":
-                m4a_info = MP4(track_abs_path)
-                cut_end = int(m4a_info.info.length * m4a_info.info.sample_rate)
-            else:
-                mp3 = MP3(track_abs_path)
-                cut_end = int(mp3.info.length * mp3.info.sample_rate)
-            print(f"\nCutting from Cue {HOTCUE_START} to end of track …")
+        print(f"\nCutting between Cue {CUT_BETWEEN_CUES_START} and Cue {CUT_BETWEEN_CUES_END} …")
 
-        else:  # CUT_BETWEEN_CUES
-            if HOTCUE_END not in hotcues:
-                print(f"\nError: Hotcue {HOTCUE_END} is not set on this track.")
-                sys.exit(1)
-            cut_end = hotcues[HOTCUE_END]
-            if cut_start >= cut_end:
-                print(
-                    f"\nError: Hotcue {HOTCUE_START} ({cut_start:.0f} samples) must be "
-                    f"before Hotcue {HOTCUE_END} ({cut_end:.0f} samples)."
-                )
-                sys.exit(1)
-            print(f"\nCutting between Cue {HOTCUE_START} and Cue {HOTCUE_END} …")
+        if ext_lower == ".mp3":
+            cut_mp3(track_abs_path, output_filepath, cut_start, cut_end)
+        elif ext_lower == ".flac":
+            cut_flac(track_abs_path, output_filepath, cut_start, cut_end)
+        elif ext_lower == ".m4a":
+            cut_m4a(track_abs_path, output_filepath, cut_start, cut_end)
+        else:
+            cut_wav(track_abs_path, output_filepath, cut_start, cut_end)
 
-        # Reverb tail only makes sense when cutting to the end of the track
-        add_reverb = REVERB_TAIL and (MODE == "CUT_TO_END")
+    elif MODE == "CUT_TO_END":
+        hotcues = get_hotcues(ENGINE_DB_PATH, track_id)
+        print(f"\n  Available hotcues:")
+        for num in sorted(hotcues):
+            secs = hotcues[num] / 44100
+            mins = int(secs) // 60
+            remainder = secs - mins * 60
+            print(f"    Cue {num}:  {mins}:{remainder:05.2f}  ({hotcues[num]:.0f} samples)")
+
+        if CUT_TO_END_HOTCUE not in hotcues:
+            print(f"\nError: Hotcue {CUT_TO_END_HOTCUE} is not set on this track.")
+            sys.exit(1)
+
+        cut_start = hotcues[CUT_TO_END_HOTCUE]
+
+        if ext_lower in (".flac", ".wav"):
+            cut_end = sf.info(track_abs_path).frames
+        elif ext_lower == ".m4a":
+            m4a_info = MP4(track_abs_path)
+            cut_end = int(m4a_info.info.length * m4a_info.info.sample_rate)
+        else:
+            mp3 = MP3(track_abs_path)
+            cut_end = int(mp3.info.length * mp3.info.sample_rate)
+
+        print(f"\nCutting from Cue {CUT_TO_END_HOTCUE} to end of track …")
+        add_reverb = CUT_TO_END_REVERB_TAIL
 
         if ext_lower == ".mp3":
             cut_mp3(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
@@ -1247,54 +1263,56 @@ def main():
             cut_wav(track_abs_path, output_filepath, cut_start, cut_end, reverb_tail=add_reverb)
 
     elif MODE == "ADD_SILENCE":
-        # Exactly one insertion-point source must be specified
-        if SILENCE_CUE is None and SILENCE_TIMESTAMP is None:
-            print("Error: In ADD_SILENCE mode set either SILENCE_CUE or SILENCE_TIMESTAMP.")
+        if ADD_SILENCE_CUE is None and ADD_SILENCE_TIMESTAMP is None:
+            print("Error: In ADD_SILENCE mode set either ADD_SILENCE_CUE or ADD_SILENCE_TIMESTAMP.")
             sys.exit(1)
-        if SILENCE_CUE is not None and SILENCE_TIMESTAMP is not None:
-            print("Error: Set only one of SILENCE_CUE or SILENCE_TIMESTAMP, not both.")
+        if ADD_SILENCE_CUE is not None and ADD_SILENCE_TIMESTAMP is not None:
+            print("Error: Set only one of ADD_SILENCE_CUE or ADD_SILENCE_TIMESTAMP, not both.")
             sys.exit(1)
 
-        if SILENCE_CUE is not None:
-            # Resolve the insertion point from an Engine DJ hotcue
-            if SILENCE_CUE not in hotcues:
-                print(f"\nError: Hotcue {SILENCE_CUE} is not set on this track.")
+        if ADD_SILENCE_CUE is not None:
+            hotcues = get_hotcues(ENGINE_DB_PATH, track_id)
+            print(f"\n  Available hotcues:")
+            for num in sorted(hotcues):
+                secs = hotcues[num] / 44100
+                mins = int(secs) // 60
+                remainder = secs - mins * 60
+                print(f"    Cue {num}:  {mins}:{remainder:05.2f}  ({hotcues[num]:.0f} samples)")
+
+            if ADD_SILENCE_CUE not in hotcues:
+                print(f"\nError: Hotcue {ADD_SILENCE_CUE} is not set on this track.")
                 sys.exit(1)
-            insert_at = hotcues[SILENCE_CUE]
+            insert_at = hotcues[ADD_SILENCE_CUE]
             mins = int(insert_at / 44100) // 60
             secs = (insert_at / 44100) - mins * 60
-            label = f"Cue {SILENCE_CUE} ({mins}:{secs:05.2f})"
+            label = f"Cue {ADD_SILENCE_CUE} ({mins}:{secs:05.2f})"
         else:
-            # Resolve the insertion point from a wall-clock timestamp in seconds
             if ext_lower in (".flac", ".wav"):
                 sr = sf.info(track_abs_path).samplerate
             elif ext_lower == ".m4a":
                 sr = MP4(track_abs_path).info.sample_rate
             else:
-                mp3 = MP3(track_abs_path)
-                sr = mp3.info.sample_rate
-            insert_at = SILENCE_TIMESTAMP * sr
-            mins = int(SILENCE_TIMESTAMP) // 60
-            secs = SILENCE_TIMESTAMP - mins * 60
-            label = f"{mins}:{secs:05.2f} ({SILENCE_TIMESTAMP:.3f} s)"
+                sr = MP3(track_abs_path).info.sample_rate
+            insert_at = ADD_SILENCE_TIMESTAMP * sr
+            mins = int(ADD_SILENCE_TIMESTAMP) // 60
+            secs = ADD_SILENCE_TIMESTAMP - mins * 60
+            label = f"{mins}:{secs:05.2f} ({ADD_SILENCE_TIMESTAMP:.3f} s)"
 
-        print(f"\nInserting {SILENCE_DURATION_SECS:.1f} s of silence at {label} …")
+        print(f"\nInserting {ADD_SILENCE_DURATION_SECS:.1f} s of silence at {label} …")
 
         if ext_lower == ".mp3":
-            insert_silence_mp3(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
+            insert_silence_mp3(track_abs_path, output_filepath, insert_at, ADD_SILENCE_DURATION_SECS)
         elif ext_lower == ".flac":
-            insert_silence_flac(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
+            insert_silence_flac(track_abs_path, output_filepath, insert_at, ADD_SILENCE_DURATION_SECS)
         elif ext_lower == ".m4a":
-            insert_silence_m4a(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
+            insert_silence_m4a(track_abs_path, output_filepath, insert_at, ADD_SILENCE_DURATION_SECS)
         else:
-            insert_silence_wav(track_abs_path, output_filepath, insert_at, SILENCE_DURATION_SECS)
+            insert_silence_wav(track_abs_path, output_filepath, insert_at, ADD_SILENCE_DURATION_SECS)
 
     elif MODE == "COMPRESS":
-        # Output is always .mp3 regardless of source format
         output_filename = f"{name} {OUTPUT_APPENDIX}.mp3"
         output_filepath = os.path.join(OUTPUT_PATH, output_filename)
 
-        # For MP3 sources, refuse to re-encode upward (would only degrade quality)
         if ext_lower == ".mp3":
             src_mp3 = MP3(track_abs_path)
             src_bitrate_kbps = src_mp3.info.bitrate // 1000
