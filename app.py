@@ -23,6 +23,7 @@ STATE_FILE  = os.path.join(REPO_ROOT, "ui_state.json")
 DEFAULT_STATE = {
     "track_filename": "",
     "output_appendix": "",
+    "search_full_db": True,
     "output_path": os.path.expanduser("~/Library/CloudStorage/OneDrive-Personal/DJing/Edits"),
     "engine_db_path": os.path.expanduser("~/Music/Engine Library/Database2/m.db"),
     "mode": "CUT_BETWEEN_CUES",
@@ -46,6 +47,7 @@ DEFAULT_STATE = {
     "copy_src_end_cue": 2,
     "copy_dst_start_cue": 3,
     "copy_dst_end_cue": None,
+    "copy_repeat_count": 1,
 }
 
 
@@ -99,6 +101,31 @@ def get_csv_tracks():
             seen.add(t["filename"])
             result.append(t)
     return result
+
+
+def get_db_tracks(db_path):
+    """Return list of {label, filename} for every track in the Engine DJ database."""
+    if not os.path.isfile(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    cur  = conn.cursor()
+    cur.execute("SELECT filename, title, artist FROM Track ORDER BY title COLLATE NOCASE")
+    rows = cur.fetchall()
+    conn.close()
+    tracks = []
+    seen   = set()
+    for full_path, title, artist in rows:
+        if not full_path:
+            continue
+        filename = os.path.basename(full_path.replace("\\", "/"))
+        if not filename or filename in seen:
+            continue
+        seen.add(filename)
+        title  = (title or filename).strip()
+        artist = (artist or "").strip()
+        label  = f"{title}{' — ' + artist if artist else ''}"
+        tracks.append({"label": label, "filename": filename})
+    return tracks
 
 
 def get_hotcues_for_track(db_path, filename):
@@ -213,6 +240,7 @@ def run_job(params: dict):
         mod.COPY_DST_START_CUE = int(params["copy_dst_start_cue"])
         raw_dst_end = params.get("copy_dst_end_cue")
         mod.COPY_DST_END_CUE   = int(raw_dst_end) if raw_dst_end not in (None, "", 0, "0") else None
+        mod.COPY_REPEAT_COUNT  = max(1, int(params.get("copy_repeat_count") or 1))
 
     buf = io.StringIO()
     try:
@@ -257,6 +285,14 @@ def api_state():
 @app.route("/api/csv_tracks")
 def api_csv_tracks():
     return jsonify(get_csv_tracks())
+
+
+@app.route("/api/db_tracks")
+def api_db_tracks():
+    db_path = request.args.get("db_path", "").strip()
+    if not db_path:
+        db_path = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
+    return jsonify(get_db_tracks(db_path))
 
 
 @app.route("/api/hotcues")

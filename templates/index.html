@@ -193,6 +193,12 @@
       </div>
       <div class="hint" id="track-hint"></div>
     </div>
+    <div class="field" style="margin-top:2px;">
+      <div class="toggle-row">
+        <button class="toggle" id="search-db-toggle"></button>
+        <span class="toggle-label">Search full Engine DJ database</span>
+      </div>
+    </div>
   </div>
 
   <!-- ── Settings ──────────────────────────────────────── -->
@@ -382,8 +388,13 @@
         <label>Paste end <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(optional)</span></label>
         <div class="cue-grid" id="cb-dst-end-btns"></div>
         <div class="cue-time" id="cb-dst-end-time"></div>
-        <div class="hint">Leave unselected for 1 repetition / track extension.</div>
+        <div class="hint">Leave unselected for manual repetition count / track extension.</div>
       </div>
+    </div>
+    <div class="field" id="cb-repeat-field">
+      <label>Repetitions</label>
+      <input type="number" id="copy_repeat_count" min="1" step="1" value="1">
+      <div class="hint">How many times to paste the copied section (only used when no end cue is selected).</div>
     </div>
   </div>
 
@@ -401,6 +412,7 @@
 <script>
 // ── state ──────────────────────────────────────────────────────────────────
 let csvTracks = [];
+let dbTracks  = [];
 let hotcues   = {};   // {cue_num: seconds}
 let state     = {};
 let currentMode = "CUT_BETWEEN_CUES";
@@ -417,6 +429,10 @@ async function boot() {
   applyState();
   setMode(state.mode || "CUT_BETWEEN_CUES");
 
+  // Load full DB tracks after applying state so we have the db_path value
+  const dbPath = document.getElementById("engine_db_path").value.trim();
+  dbTracks = await fetch(`/api/db_tracks?db_path=${encodeURIComponent(dbPath)}`).then(r => r.json()).catch(() => []);
+
   if (state.track_filename) {
     await loadHotcues(state.track_filename);
   }
@@ -432,6 +448,7 @@ function applyState() {
   setToggle("reverb-toggle-btn",  state.cut_to_end_reverb_tail !== false);
   setToggle("silence-cue-toggle", state.add_silence_use_cue !== false);
   setToggle("artwork-toggle",     state.compress_remove_artwork === true);
+  setToggle("search-db-toggle",   state.search_full_db !== false);
 
   setSlider("reverb_room_size",  state.cut_to_end_reverb_room_size ?? 1.0);
   setSlider("reverb_damping",    state.cut_to_end_reverb_damping   ?? 0.5);
@@ -445,10 +462,13 @@ function applyState() {
   document.getElementById("add_silence_duration_secs").value = state.add_silence_duration_secs ?? 1.0;
 
   // Copy beats — initialise state keys so rebuildCueBtns sees them
-  state.copy_src_start_cue = state.copy_src_start_cue ?? 1;
-  state.copy_src_end_cue   = state.copy_src_end_cue   ?? 2;
-  state.copy_dst_start_cue = state.copy_dst_start_cue ?? 3;
-  state.copy_dst_end_cue   = state.copy_dst_end_cue   ?? null;
+  state.copy_src_start_cue  = state.copy_src_start_cue  ?? 1;
+  state.copy_src_end_cue    = state.copy_src_end_cue    ?? 2;
+  state.copy_dst_start_cue  = state.copy_dst_start_cue  ?? 3;
+  state.copy_dst_end_cue    = state.copy_dst_end_cue    ?? null;
+
+  document.getElementById("copy_repeat_count").value = state.copy_repeat_count ?? 1;
+  updateRepeatFieldVisibility();
 
   updateSilenceSourceUI();
   setBitrateTab(state.compress_bitrate || 320);
@@ -511,6 +531,15 @@ document.querySelectorAll(".toggle").forEach(btn => {
     btn.classList.toggle("on");
     if (btn.id === "reverb-toggle-btn")  updateReverbParamsVisibility();
     if (btn.id === "silence-cue-toggle") updateSilenceSourceUI();
+    if (btn.id === "search-db-toggle") {
+      state.search_full_db = getToggle("search-db-toggle");
+      // Reload DB tracks if enabling and not yet loaded
+      if (state.search_full_db && dbTracks.length === 0) {
+        const dbPath = document.getElementById("engine_db_path").value.trim();
+        fetch(`/api/db_tracks?db_path=${encodeURIComponent(dbPath)}`).then(r => r.json())
+          .then(t => { dbTracks = t; }).catch(() => {});
+      }
+    }
   });
 });
 
@@ -527,6 +556,11 @@ function updateSilenceSourceUI() {
   document.getElementById("silence-source-label").textContent = useCue ? "Use hotcue" : "Use timestamp";
   document.getElementById("silence-cue-picker").style.display  = useCue ? "block" : "none";
   document.getElementById("silence-ts-picker").style.display   = useCue ? "none"  : "block";
+}
+
+function updateRepeatFieldVisibility() {
+  const noEndCue = state.copy_dst_end_cue === null || state.copy_dst_end_cue === undefined;
+  document.getElementById("cb-repeat-field").style.display = noEndCue ? "block" : "none";
 }
 
 // ── reverb collapsible ─────────────────────────────────────────────────────
@@ -556,7 +590,8 @@ const dropEl   = document.getElementById("track-dropdown");
 searchEl.addEventListener("input", () => {
   const q = searchEl.value.toLowerCase().trim();
   if (!q) { dropEl.style.display = "none"; return; }
-  const matches = csvTracks.filter(t =>
+  const source = getToggle("search-db-toggle") ? dbTracks : csvTracks;
+  const matches = source.filter(t =>
     t.label.toLowerCase().includes(q) || t.filename.toLowerCase().includes(q)
   ).slice(0, 40);
   if (!matches.length) { dropEl.style.display = "none"; return; }
@@ -619,6 +654,10 @@ async function loadHotcues(filename) {
 }
 
 document.getElementById("engine_db_path").addEventListener("change", () => {
+  const dbPath = document.getElementById("engine_db_path").value.trim();
+  // Refresh db track list with new path
+  fetch(`/api/db_tracks?db_path=${encodeURIComponent(dbPath)}`).then(r => r.json())
+    .then(t => { dbTracks = t; }).catch(() => {});
   const fn = searchEl.value.trim();
   if (fn) loadHotcues(fn);
 });
@@ -693,7 +732,10 @@ function rebuildCueBtns() {
   makeCueBtns("cb-src-start-btns", state.copy_src_start_cue || 1, "cb-src-start-time", v => { state.copy_src_start_cue = v; });
   makeCueBtns("cb-src-end-btns",   state.copy_src_end_cue   || 2, "cb-src-end-time",   v => { state.copy_src_end_cue   = v; });
   makeCueBtns("cb-dst-start-btns", state.copy_dst_start_cue || 3, "cb-dst-start-time", v => { state.copy_dst_start_cue = v; });
-  makeCueBtnsOptional("cb-dst-end-btns", state.copy_dst_end_cue ?? null, "cb-dst-end-time", v => { state.copy_dst_end_cue = v; });
+  makeCueBtnsOptional("cb-dst-end-btns", state.copy_dst_end_cue ?? null, "cb-dst-end-time", v => {
+    state.copy_dst_end_cue = v;
+    updateRepeatFieldVisibility();
+  });
 }
 
 function fmtSecs(s) {
@@ -712,6 +754,7 @@ document.getElementById("run-btn").addEventListener("click", async () => {
     output_appendix: document.getElementById("output_appendix").value.trim(),
     output_path:     document.getElementById("output_path").value.trim(),
     engine_db_path:  document.getElementById("engine_db_path").value.trim(),
+    search_full_db:  getToggle("search-db-toggle"),
     mode:            currentMode,
 
     // CUT_BETWEEN_CUES
@@ -743,6 +786,7 @@ document.getElementById("run-btn").addEventListener("click", async () => {
     copy_src_end_cue:   state.copy_src_end_cue   || 2,
     copy_dst_start_cue: state.copy_dst_start_cue || 3,
     copy_dst_end_cue:   state.copy_dst_end_cue   ?? null,
+    copy_repeat_count:  parseInt(document.getElementById("copy_repeat_count").value) || 1,
   };
 
   // persist state
