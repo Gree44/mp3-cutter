@@ -172,6 +172,24 @@
 
   .hint { font-size: .75rem; color: var(--muted); margin-top: 3px; }
   .sep { border: none; border-top: 1px solid var(--border); margin: 4px 0; }
+
+  /* disambiguation panel */
+  #disambig-card { display: none; }
+  .disambig-opt {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 10px 0; border-bottom: 1px solid var(--border); cursor: pointer;
+  }
+  .disambig-opt:last-child { border-bottom: none; }
+  .disambig-opt:hover .disambig-inner { color: var(--text); }
+  .disambig-inner { flex: 1; min-width: 0; }
+  .disambig-fn  { font-size: .88rem; font-weight: 600; word-break: break-all; }
+  .disambig-path { font-size: .75rem; color: var(--muted); word-break: break-all; margin-top: 2px; }
+  .disambig-badge {
+    font-size: .7rem; font-weight: 700; padding: 2px 7px; border-radius: 5px;
+    flex-shrink: 0; margin-top: 2px;
+  }
+  .badge-ok      { background: rgba(62,207,142,.15); color: var(--green); }
+  .badge-missing { background: rgba(240,78,96,.15);  color: var(--red); }
 </style>
 </head>
 <body>
@@ -199,6 +217,12 @@
         <span class="toggle-label">Search full Engine DJ database</span>
       </div>
     </div>
+  </div>
+
+  <!-- ── Disambiguation ───────────────────────────────── -->
+  <div class="card" id="disambig-card">
+    <h2>Multiple matches — choose a track</h2>
+    <div id="disambig-list"></div>
   </div>
 
   <!-- ── Settings ──────────────────────────────────────── -->
@@ -416,6 +440,7 @@ let dbTracks  = [];
 let hotcues   = {};   // {cue_num: seconds}
 let state     = {};
 let currentMode = "CUT_BETWEEN_CUES";
+let selectedTrackId = null;  // set after disambiguation or single-match lookup
 
 // ── boot ───────────────────────────────────────────────────────────────────
 async function boot() {
@@ -434,6 +459,7 @@ async function boot() {
   dbTracks = await fetch(`/api/db_tracks?db_path=${encodeURIComponent(dbPath)}`).then(r => r.json()).catch(() => []);
 
   if (state.track_filename) {
+    selectedTrackId = null;
     await loadHotcues(state.track_filename);
   }
 }
@@ -612,6 +638,7 @@ dropEl.addEventListener("click", async e => {
   const fn = opt.dataset.fn;
   searchEl.value       = fn;
   dropEl.style.display = "none";
+  selectedTrackId = null;
   document.getElementById("track-hint").textContent = opt.querySelector(".sub")?.textContent || "";
   await loadHotcues(fn);
 });
@@ -623,6 +650,7 @@ searchEl.addEventListener("keydown", e => {
   if (e.key === "Escape") dropEl.style.display = "none";
   if (e.key === "Enter") {
     dropEl.style.display = "none";
+    selectedTrackId = null;
     loadHotcues(searchEl.value.trim());
   }
 });
@@ -632,25 +660,100 @@ function esc(s) {
 }
 
 // ── hotcue loading ─────────────────────────────────────────────────────────
-async function loadHotcues(filename) {
-  if (!filename) { hotcues = {}; rebuildCueBtns(); return; }
+async function loadHotcues(filename, trackId) {
+  if (!filename) { hotcues = {}; selectedTrackId = null; rebuildCueBtns(); return; }
   const dbPath = document.getElementById("engine_db_path").value.trim();
-  const url    = `/api/hotcues?filename=${encodeURIComponent(filename)}&db_path=${encodeURIComponent(dbPath)}`;
+  let url = `/api/hotcues?filename=${encodeURIComponent(filename)}&db_path=${encodeURIComponent(dbPath)}`;
+  if (trackId != null) url += `&track_id=${encodeURIComponent(trackId)}`;
+
+  hideDisambig();
   try {
     const data = await fetch(url).then(r => r.json());
+
+    if (data.multiple) {
+      // More than one DB row matched — show picker, defer hotcue display
+      hotcues = {};
+      selectedTrackId = null;
+      rebuildCueBtns();
+      showDisambig(data.multiple, filename);
+      document.getElementById("track-hint").textContent =
+        `⚠ ${data.multiple.length} tracks share this filename — choose one below`;
+      return;
+    }
+
     if (data.error) {
       hotcues = {};
+      selectedTrackId = null;
       document.getElementById("track-hint").textContent = "⚠ " + data.error;
+      // Still show a file-missing warning if we got track metadata back
+      if (data._file_exists === false) {
+        document.getElementById("track-hint").textContent +=
+          " (audio file not found on disk)";
+      }
     } else {
-      hotcues = data;
+      selectedTrackId = data._track_id ?? null;
+      const fileExists = data._file_exists;
+      const absPath    = data._abs_path || "";
+
+      // Strip internal keys before using as hotcue map
+      hotcues = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (!k.startsWith("_")) hotcues[parseInt(k)] = v;
+      }
+
       const count = Object.keys(hotcues).length;
-      document.getElementById("track-hint").textContent =
-        count ? `${count} hotcue${count>1?"s":""} found in Engine DJ` : "No hotcues found";
+      let hint = count
+        ? `${count} hotcue${count > 1 ? "s" : ""} found in Engine DJ`
+        : "No hotcues found";
+      if (fileExists === false) {
+        hint += " — ⚠ audio file not found on disk";
+        document.getElementById("track-hint").style.color = "var(--red)";
+      } else {
+        document.getElementById("track-hint").style.color = "";
+      }
+      document.getElementById("track-hint").textContent = hint;
     }
   } catch(e) {
     hotcues = {};
+    selectedTrackId = null;
   }
   rebuildCueBtns();
+}
+
+// ── disambiguation panel ───────────────────────────────────────────────────
+function showDisambig(choices, filename) {
+  const card = document.getElementById("disambig-card");
+  const list = document.getElementById("disambig-list");
+  list.innerHTML = choices.map((c, i) => {
+    const badge = c.exists
+      ? `<span class="disambig-badge badge-ok">file found</span>`
+      : `<span class="disambig-badge badge-missing">file missing</span>`;
+    return `<div class="disambig-opt" data-i="${i}" data-track-id="${esc(String(c.track_id))}"
+                 data-fn="${esc(c.filename)}" data-exists="${c.exists}">
+              <div class="disambig-inner">
+                <div class="disambig-fn">${esc(c.filename)}</div>
+                <div class="disambig-path">${esc(c.path)}</div>
+              </div>
+              ${badge}
+            </div>`;
+  }).join("");
+  list._choices = choices;
+  card.style.display = "block";
+
+  list.querySelectorAll(".disambig-opt").forEach(opt => {
+    opt.addEventListener("click", async () => {
+      const tid = opt.dataset.trackId;
+      const fn  = opt.dataset.fn;
+      searchEl.value = fn;
+      hideDisambig();
+      await loadHotcues(fn, tid);
+    });
+  });
+}
+
+function hideDisambig() {
+  document.getElementById("disambig-card").style.display = "none";
+  document.getElementById("disambig-list").innerHTML = "";
 }
 
 document.getElementById("engine_db_path").addEventListener("change", () => {
@@ -751,6 +854,7 @@ document.getElementById("run-btn").addEventListener("click", async () => {
 
   const params = {
     track_filename:  filename,
+    track_id:        selectedTrackId,
     output_appendix: document.getElementById("output_appendix").value.trim(),
     output_path:     document.getElementById("output_path").value.trim(),
     engine_db_path:  document.getElementById("engine_db_path").value.trim(),

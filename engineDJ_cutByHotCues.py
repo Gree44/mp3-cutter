@@ -240,7 +240,13 @@ def _patch_xing_header(frame_data, new_frame_count, new_byte_count):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def find_track(db_path, filename):
-    """Look up a track by filename. Returns (id, path, filename)."""
+    """Look up a track by filename. Returns (id, path, filename).
+
+    When multiple DB rows share the filename, paths are resolved and checked on
+    disk.  If exactly one resolves to an existing file it is selected
+    automatically.  Otherwise the user is prompted to choose, with a note next
+    to each entry indicating whether the file was found on disk.
+    """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
@@ -261,14 +267,51 @@ def find_track(db_path, filename):
         sys.exit(1)
 
     if len(results) > 1:
-        print(f"\nWarning: {len(results)} tracks match '{filename}':")
-        for i, (tid, path, fn) in enumerate(results):
-            print(f"  [{i + 1}] {fn}  —  {path}")
+        # Resolve every candidate and check which files actually exist on disk.
+        annotated = []
+        for tid, path, fn in results:
+            abs_path = resolve_track_path(db_path, path)
+            exists   = os.path.isfile(abs_path)
+            annotated.append((tid, path, fn, abs_path, exists))
+
+        existing = [r for r in annotated if r[4]]
+        if len(existing) == 1:
+            tid, path, fn, abs_path, _ = existing[0]
+            print(f"Note: {len(annotated)} DB entries share this filename; "
+                  f"auto-selected the one whose file exists on disk:\n  {abs_path}")
+            return (tid, path, fn)
+
+        if len(existing) > 1:
+            # Deduplicate by resolved absolute path — multiple DB entries can map
+            # to the same file when PATH_REMAPS rewrites a stale location.
+            by_abs = {}
+            for r in existing:
+                by_abs.setdefault(r[3], []).append(r)
+            if len(by_abs) == 1:
+                # All entries point to the same file; prefer the one whose stored
+                # path resolves directly (no remap needed) — that is the current entry.
+                candidates = list(by_abs.values())[0]
+                best = next(
+                    (r for r in candidates if os.path.normpath(os.path.expanduser(r[1])) == r[3]),
+                    candidates[0],
+                )
+                tid, path, fn, abs_path, _ = best
+                print(f"Note: {len(annotated)} DB entries share this filename and resolve "
+                      f"to the same file (stale path after a move); "
+                      f"auto-selected the current entry:\n  {abs_path}")
+                return (tid, path, fn)
+
+        # Still ambiguous — prompt the user and show existence status.
+        print(f"\nWarning: {len(annotated)} tracks match '{filename}':")
+        for i, (tid, path, fn, abs_path, exists) in enumerate(annotated):
+            status = "file found" if exists else "file missing"
+            print(f"  [{i + 1}] {fn}  —  {abs_path}  ({status})")
         while True:
             try:
                 choice = int(input("\nChoose a track number: "))
-                if 1 <= choice <= len(results):
-                    return results[choice - 1]
+                if 1 <= choice <= len(annotated):
+                    tid, path, fn, _, _ = annotated[choice - 1]
+                    return (tid, path, fn)
             except ValueError:
                 pass
             print("Invalid choice, try again.")

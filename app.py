@@ -20,6 +20,19 @@ app = Flask(__name__)
 REPO_ROOT   = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE  = os.path.join(REPO_ROOT, "ui_state.json")
 
+
+def _engine_module():
+    """Return the engineDJ_cutByHotCues module, loading it once and caching it."""
+    if not hasattr(_engine_module, "_mod"):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "engineDJ", os.path.join(REPO_ROOT, "engineDJ_cutByHotCues.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _engine_module._mod = mod
+    return _engine_module._mod
+
 DEFAULT_STATE = {
     "track_filename": "",
     "output_appendix": "",
@@ -128,53 +141,101 @@ def get_db_tracks(db_path):
     return tracks
 
 
-def get_hotcues_for_track(db_path, filename):
-    """Return dict of {cue_number: seconds} for the given filename, or error string."""
+def _parse_hotcue_blob(blob):
+    """Parse a quickCues blob.  Returns dict {cue_number: seconds} or raises."""
+    data     = zlib.decompress(blob[4:])
+    num_cues = struct.unpack(">q", data[:8])[0]
+    pos      = 8
+    hotcues  = {}
+    for i in range(num_cues):
+        if pos + 1 > len(data):
+            break
+        name_len = data[pos]
+        pos += 1
+        if pos + name_len + 12 > len(data):
+            break
+        pos += name_len
+        position = struct.unpack(">d", data[pos: pos + 8])[0]
+        pos += 8
+        pos += 4
+        if position >= 0:
+            hotcues[i + 1] = round(position / 44100, 3)
+    return hotcues
+
+
+def get_hotcues_for_track(db_path, filename, track_id=None):
+    """Return hotcue data for a track.
+
+    When *track_id* is supplied the lookup is exact (no disambiguation needed).
+
+    Otherwise the function searches by filename.  If multiple DB rows match it
+    returns ``{"multiple": [{"track_id": …, "path": …, "exists": bool}, …]}``
+    so the caller can let the user choose.
+
+    The normal success response adds ``_track_id`` and ``_file_exists`` keys so
+    the UI can warn when the audio file is missing on disk.
+    """
     if not os.path.isfile(db_path):
         return {"error": f"Engine DJ database not found: {db_path}"}
 
     conn = sqlite3.connect(db_path)
     cur  = conn.cursor()
-    cur.execute("SELECT id FROM Track WHERE filename = ?", (filename,))
-    rows = cur.fetchall()
-    if not rows:
-        cur.execute("SELECT id FROM Track WHERE filename LIKE ?", (f"%{filename}%",))
+
+    if track_id is not None:
+        cur.execute("SELECT id, path, filename FROM Track WHERE id = ?", (int(track_id),))
         rows = cur.fetchall()
+    else:
+        cur.execute("SELECT id, path, filename FROM Track WHERE filename = ?", (filename,))
+        rows = cur.fetchall()
+        if not rows:
+            cur.execute("SELECT id, path, filename FROM Track WHERE filename LIKE ?",
+                        (f"%{filename}%",))
+            rows = cur.fetchall()
+
     if not rows:
         conn.close()
         return {"error": f"Track '{filename}' not found in Engine DJ library"}
 
-    track_id = rows[0][0]
-    cur.execute("SELECT quickCues FROM PerformanceData WHERE trackId = ?", (track_id,))
+    # Multiple matches → ask the user to disambiguate
+    if len(rows) > 1:
+        eng = _engine_module()
+        choices = []
+        for tid, rel_path, fn in rows:
+            abs_path = eng.resolve_track_path(db_path, rel_path)
+            choices.append({
+                "track_id": tid,
+                "filename": fn,
+                "path":     abs_path,
+                "exists":   os.path.isfile(abs_path),
+            })
+        conn.close()
+        return {"multiple": choices}
+
+    chosen_id, rel_path, _ = rows[0]
+    eng        = _engine_module()
+    abs_path   = eng.resolve_track_path(db_path, rel_path)
+    file_exists = os.path.isfile(abs_path)
+
+    cur.execute("SELECT quickCues FROM PerformanceData WHERE trackId = ?", (chosen_id,))
     row = cur.fetchone()
     conn.close()
 
     if not row or not row[0]:
-        return {"error": "No hotcue data found for this track"}
+        result = {"error": "No hotcue data found for this track"}
+        result["_track_id"]    = chosen_id
+        result["_file_exists"] = file_exists
+        result["_abs_path"]    = abs_path
+        return result
 
-    blob = row[0]
     try:
-        data     = zlib.decompress(blob[4:])
-        num_cues = struct.unpack(">q", data[:8])[0]
-        pos      = 8
-        hotcues  = {}
-        for i in range(num_cues):
-            if pos + 1 > len(data):
-                break
-            name_len = data[pos]
-            pos += 1
-            if pos + name_len + 12 > len(data):
-                break
-            pos += name_len
-            position = struct.unpack(">d", data[pos: pos + 8])[0]
-            pos += 8
-            pos += 4
-            if position >= 0:
-                secs = position / 44100
-                hotcues[i + 1] = round(secs, 3)
+        hotcues = _parse_hotcue_blob(row[0])
     except Exception as exc:
-        return {"error": f"Failed to parse hotcue data: {exc}"}
+        return {"error": f"Failed to parse hotcue data: {exc}",
+                "_track_id": chosen_id, "_file_exists": file_exists, "_abs_path": abs_path}
 
+    hotcues["_track_id"]    = chosen_id
+    hotcues["_file_exists"] = file_exists
+    hotcues["_abs_path"]    = abs_path
     return hotcues
 
 
@@ -193,11 +254,38 @@ def run_job(params: dict):
     """Execute the cut/silence/compress operation in a background thread."""
     import importlib.util, io, contextlib
 
-    spec   = importlib.util.spec_from_file_location(
+    spec = importlib.util.spec_from_file_location(
         "engineDJ", os.path.join(REPO_ROOT, "engineDJ_cutByHotCues.py")
     )
-    mod    = importlib.util.module_from_spec(spec)
+    mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+
+    # When the UI has already resolved a unique track_id (e.g. after disambiguation)
+    # we patch find_track to return that row directly without any interactive prompt.
+    chosen_track_id = params.get("track_id")
+    if chosen_track_id is not None:
+        try:
+            chosen_track_id = int(chosen_track_id)
+        except (TypeError, ValueError):
+            chosen_track_id = None
+
+    if chosen_track_id is not None:
+        db_path_for_patch = params.get("engine_db_path",
+                                       os.path.expanduser("~/Music/Engine Library/Database2/m.db"))
+
+        def _patched_find_track(db_path, filename):
+            conn = sqlite3.connect(db_path)
+            cur  = conn.cursor()
+            cur.execute("SELECT id, path, filename FROM Track WHERE id = ?", (chosen_track_id,))
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                return row
+            import sys as _sys
+            print(f"Error: track_id {chosen_track_id} not found in database.")
+            _sys.exit(1)
+
+        mod.find_track = _patched_find_track
 
     # Patch all config globals on the imported module
     mod.TRACK_FILENAME  = params["track_filename"]
@@ -299,11 +387,12 @@ def api_db_tracks():
 def api_hotcues():
     filename = request.args.get("filename", "").strip()
     db_path  = request.args.get("db_path", "").strip()
-    if not filename:
-        return jsonify({"error": "filename required"}), 400
+    track_id = request.args.get("track_id", "").strip() or None
+    if not filename and not track_id:
+        return jsonify({"error": "filename or track_id required"}), 400
     if not db_path:
         db_path = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
-    result = get_hotcues_for_track(db_path, filename)
+    result = get_hotcues_for_track(db_path, filename, track_id=track_id)
     return jsonify(result)
 
 
