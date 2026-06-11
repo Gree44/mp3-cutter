@@ -420,6 +420,13 @@
       <input type="number" id="copy_repeat_count" min="1" step="1" value="1">
       <div class="hint">How many times to paste the copied section (only used when no end cue is selected).</div>
     </div>
+    <div class="field">
+      <div class="toggle-row">
+        <button class="toggle" id="paste-mode-toggle"></button>
+        <span class="toggle-label" id="paste-mode-label"></span>
+      </div>
+      <div class="hint">Off: layer the copy on top of existing audio (default). On: overwrite the existing audio in the paste region.</div>
+    </div>
   </div>
 
   <!-- ── Run ───────────────────────────────────────────── -->
@@ -496,6 +503,9 @@ function applyState() {
   document.getElementById("copy_repeat_count").value = state.copy_repeat_count ?? 1;
   updateRepeatFieldVisibility();
 
+  setToggle("paste-mode-toggle", state.copy_paste_mode === "REPLACE");
+  updatePasteModeUI();
+
   updateSilenceSourceUI();
   setBitrateTab(state.compress_bitrate || 320);
   updateReverbParamsVisibility();
@@ -557,6 +567,7 @@ document.querySelectorAll(".toggle").forEach(btn => {
     btn.classList.toggle("on");
     if (btn.id === "reverb-toggle-btn")  updateReverbParamsVisibility();
     if (btn.id === "silence-cue-toggle") updateSilenceSourceUI();
+    if (btn.id === "paste-mode-toggle")  updatePasteModeUI();
     if (btn.id === "search-db-toggle") {
       state.search_full_db = getToggle("search-db-toggle");
       // Reload DB tracks if enabling and not yet loaded
@@ -587,6 +598,11 @@ function updateSilenceSourceUI() {
 function updateRepeatFieldVisibility() {
   const noEndCue = state.copy_dst_end_cue === null || state.copy_dst_end_cue === undefined;
   document.getElementById("cb-repeat-field").style.display = noEndCue ? "block" : "none";
+}
+
+function updatePasteModeUI() {
+  const replace = getToggle("paste-mode-toggle");
+  document.getElementById("paste-mode-label").textContent = replace ? "Replace existing audio" : "Layer on top of existing audio";
 }
 
 // ── reverb collapsible ─────────────────────────────────────────────────────
@@ -891,6 +907,7 @@ document.getElementById("run-btn").addEventListener("click", async () => {
     copy_dst_start_cue: state.copy_dst_start_cue || 3,
     copy_dst_end_cue:   state.copy_dst_end_cue   ?? null,
     copy_repeat_count:  parseInt(document.getElementById("copy_repeat_count").value) || 1,
+    copy_paste_mode:    getToggle("paste-mode-toggle") ? "REPLACE" : "ADD",
   };
 
   // persist state

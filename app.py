@@ -61,6 +61,7 @@ DEFAULT_STATE = {
     "copy_dst_start_cue": 3,
     "copy_dst_end_cue": None,
     "copy_repeat_count": 1,
+    "copy_paste_mode": "ADD",
 }
 
 
@@ -332,6 +333,8 @@ def run_job(params: dict):
         raw_dst_end = params.get("copy_dst_end_cue")
         mod.COPY_DST_END_CUE   = int(raw_dst_end) if raw_dst_end not in (None, "", 0, "0") else None
         mod.COPY_REPEAT_COUNT  = max(1, int(params.get("copy_repeat_count") or 1))
+        raw_mode = (params.get("copy_paste_mode") or "ADD").upper()
+        mod.COPY_PASTE_MODE    = "REPLACE" if raw_mode == "REPLACE" else "ADD"
 
     buf = io.StringIO()
     try:
