@@ -2,4 +2,4 @@ __pycache__/
 *.pyc
 *.flac
 *.wav
-*.mp3
+# *.mp3
