@@ -233,10 +233,13 @@ def get_hotcues_for_track(db_path, filename, track_id=None):
         return {"error": f"Failed to parse hotcue data: {exc}",
                 "_track_id": chosen_id, "_file_exists": file_exists, "_abs_path": abs_path}
 
-    hotcues["_track_id"]    = chosen_id
-    hotcues["_file_exists"] = file_exists
-    hotcues["_abs_path"]    = abs_path
-    return hotcues
+    # Stringify int cue-number keys so jsonify (sort_keys=True) doesn't try to
+    # compare them against the "_track_id" / "_file_exists" / "_abs_path" keys.
+    result = {str(k): v for k, v in hotcues.items()}
+    result["_track_id"]    = chosen_id
+    result["_file_exists"] = file_exists
+    result["_abs_path"]    = abs_path
+    return result
 
 
 # ── job execution (runs in background thread) ────────────────────────────────
