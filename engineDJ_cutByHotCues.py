@@ -205,6 +205,35 @@ def read_id3v2_size(data):
     return size + 10
 
 
+def _strip_xing_frame(audio_bytes):
+    """If the first MP3 frame in audio_bytes is a Xing/Info VBR header (a metadata-only
+    frame produced by LAME-class encoders), return the bytes with that frame removed.
+    Otherwise return the input unchanged.
+
+    The Xing frame is silent — splicing it into the middle of a track inserts
+    ~26 ms of audible silence — so re-encoded chunks must have it stripped before
+    being concatenated with original frames.
+    """
+    if len(audio_bytes) < 4:
+        return audio_bytes
+    info = parse_frame_header(audio_bytes[:4])
+    if info is None:
+        return audio_bytes
+    header = struct.unpack(">I", audio_bytes[:4])[0]
+    version_bits = (header >> 19) & 0x03
+    layer_bits   = (header >> 17) & 0x03
+    version = {0: 2.5, 2: 2, 3: 1}.get(version_bits)
+    layer   = {1: 3, 2: 2, 3: 1}.get(layer_bits)
+    if layer != 3:
+        return audio_bytes
+    xing_off = 36 if version == 1 else 21
+    if len(audio_bytes) < xing_off + 4:
+        return audio_bytes
+    if audio_bytes[xing_off:xing_off + 4] not in (b"Xing", b"Info"):
+        return audio_bytes
+    return audio_bytes[info["frame_size"]:]
+
+
 def _patch_xing_header(frame_data, new_frame_count, new_byte_count):
     """Update the Xing/Info VBR header inside an MP3 frame with new totals.
     Returns patched bytes, or the original bytes unchanged if no header is found."""
@@ -1494,10 +1523,16 @@ def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_e
         reenc_audio = reenc_raw[reenc_id3:]
         if len(reenc_audio) >= 128 and reenc_audio[-128:-125] == b"TAG":
             reenc_audio = reenc_audio[:-128]
+        # LAME-class encoders prepend a silent Xing/Info VBR header frame.
+        # If left in, it inserts ~26 ms of silence at the splice point.
+        reenc_audio = _strip_xing_frame(reenc_audio)
         reenc_bytes = reenc_audio
 
-    # If the paste extends past the original track end, encode the extra PCM
-    if paste_end_sample > total_original_samples:
+    # If the paste extends past the original track end AND the re-encode block
+    # didn't already cover that extension, encode the leftover PCM separately.
+    # (When first_paste_frame is set, reenc_end_sample already reaches
+    # paste_end_sample, so extension_bytes would duplicate audio — skip it.)
+    if paste_end_sample > total_original_samples and first_paste_frame is None:
         extra_pcm = pcm_mixed[total_original_samples:paste_end_sample]
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
         os.close(tmp_fd)
@@ -1512,6 +1547,7 @@ def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_e
         ext_audio = ext_raw[ext_id3:]
         if len(ext_audio) >= 128 and ext_audio[-128:-125] == b"TAG":
             ext_audio = ext_audio[:-128]
+        ext_audio = _strip_xing_frame(ext_audio)
         extension_bytes = ext_audio
 
     # --- Assemble output ----------------------------------------------------
